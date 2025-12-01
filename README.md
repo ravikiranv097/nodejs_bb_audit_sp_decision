@@ -1,9 +1,3 @@
-Below is a complete, clean, production-ready **README.md** for your Bitbucket Audit Automation project.
-
-You can copy–paste it directly into a file named **README.md** in your repository.
-
----
-
 # **Bitbucket Access Audit Automation**
 
 Automated XLSX parsing → permission evaluation → screenshot capture → DOCX report generation
@@ -171,7 +165,6 @@ The generated report includes:
 * Title page
 * Automatically generated timestamp
 * One screenshot per page
-* No filenames in the pages
 * Screenshots fit full document width
 * Inline VML images compatible with MS Word
 
@@ -194,34 +187,3 @@ Ensure:
 * No images appear as attachments
 
 ---
-
-# 🐳 **Docker Support (Optional)**
-
-If needed, a Dockerfile can be provided that includes:
-
-* Node 20
-* Chromium + Puppeteer deps
-* officegen
-* All system dependencies preinstalled
-
-Ask for **Dockerfile** if required.
-
----
-
-# 📞 **Support / Enhancements**
-
-Available enhancements:
-
-* PDF report generation
-* Summary table in DOCX
-* Kubernetes CronJob setup
-* Email delivery of audit results
-* Integration with CI/CD pipelines
-
-Just raise a request!
-
----
-
-# 🎉 **You're all set!**
-
-This automation now lets you confidently generate Bitbucket access audit evidence with zero manual effort.
