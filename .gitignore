@@ -1,0 +1,36 @@
+# .gitignore for NodeJS projects
+# Ignore node_modules directory
+node_modules/
+# Ignore log files
+*.log
+# Ignore environment variable files
+.env
+# Ignore build directories
+dist/
+build/
+# Ignore coverage reports
+coverage/
+# Ignore temporary files
+tmp/
+temp/
+# Ignore OS generated files
+.DS_Store
+Thumbs.db
+# Ignore IDE specific files
+.vscode/
+.idea/
+# Ignore npm debug files
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+# Ignore package lock files
+package-lock.json
+yarn.lock
+# Ignore test output
+test-output/
+# Ignore compiled JavaScript files if using TypeScript
+*.js.map
+# Ignore reports
+reports/
+# Ignore screenshots
+screenshots/
