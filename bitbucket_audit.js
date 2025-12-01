@@ -26,6 +26,17 @@ const ACCESS_OUTPUT_CSV = path.join(OUTPUT_DIR, 'access_check_results.csv');
 const NO_ACCESS_OUTPUT_CSV = path.join(OUTPUT_DIR, 'no_access_check_results.csv');
 const SCREENSHOTS_DIR = path.join(OUTPUT_DIR, 'screenshots');
 
+const HAS_ACCESS_PNG_DIR = path.join(OUTPUT_DIR, "png/has_access");
+const NO_ACCESS_PNG_DIR = path.join(OUTPUT_DIR, "png/no_access");
+
+const DOC_DIR = path.join(OUTPUT_DIR, "doc");
+
+// Create all required directories
+ensureDir(OUTPUT_DIR);
+ensureDir(HAS_ACCESS_PNG_DIR);
+ensureDir(NO_ACCESS_PNG_DIR);
+ensureDir(DOC_DIR);
+
 // Bitbucket API config
 const URL = process.env.BB_URL;
 const USERNAME = process.env.BB_USERNAME;
@@ -174,13 +185,11 @@ async function performAccessCheck() {
   console.log('Step 4: Performing Bitbucket access check...');
 
   const HTML_DIR = path.join(OUTPUT_DIR, 'html');
-  const PNG_DIR = path.join(OUTPUT_DIR, 'png');
 
-  ensureDir(OUTPUT_DIR);
   ensureDir(HTML_DIR);
-  ensureDir(PNG_DIR);
+  ensureDir(HAS_ACCESS_PNG_DIR);
+  ensureDir(NO_ACCESS_PNG_DIR);
 
-  // Prepare CSV headers
   fs.writeFileSync(
     ACCESS_OUTPUT_CSV,
     csvRow([
@@ -203,17 +212,12 @@ async function performAccessCheck() {
       'Access Permission',
       'Access Status',
       'Timestamp',
+      'Screenshot File'
     ]) + '\n'
   );
 
-  if (!fs.existsSync(FORMATTED_CSV)) {
-    console.warn(`Formatted CSV not found at ${FORMATTED_CSV}`);
-    return;
-  }
-
   const content = fs.readFileSync(FORMATTED_CSV, 'utf8');
   const rows = content.split(/\r?\n/).filter((l) => l.trim());
-
   if (rows.length <= 1) return;
 
   let browser = null;
@@ -252,49 +256,42 @@ async function performAccessCheck() {
     const ts = formatTimestamp();
     const safe_ts = formatSafeTimestamp();
 
-    if (has_access) {
-      // HTML + PNG file paths
-      const htmlFile = path.join(
-        HTML_DIR,
-        `${user_sso}_${project_key}_${safe_ts}.html`
-      );
-      const pngFile = path.join(
-        PNG_DIR,
-        `${user_sso}_${project_key}_${safe_ts}.png`
-      );
+    const htmlFile = path.join(
+      HTML_DIR,
+      `${user_sso}_${project_key}_${safe_ts}.html`
+    );
 
-      // Generate HTML
-      const html = `
+    const html = `
 <html>
   <body style="font-family: monospace; padding: 20px;">
     <h2>Bitbucket Access Check</h2>
     <b>User:</b> ${user_sso}<br>
     <b>Project:</b> ${project_key}<br>
     <b>Timestamp:</b> ${ts}<br><br>
-
     <h3>REST API URL</h3>
     <p>${api_url}</p>
-
     <h3>API Response</h3>
     <pre>${JSON.stringify(responseData, null, 2)}</pre>
   </body>
 </html>`;
 
-      fs.writeFileSync(htmlFile, html);
+    fs.writeFileSync(htmlFile, html);
 
-      // Take screenshot without excessive blank area
-      const pageIns = await getBrowserPage();
-      await pageIns.goto('file://' + htmlFile, { waitUntil: 'networkidle0' });
+    const pageIns = await getBrowserPage();
+    await pageIns.goto('file://' + htmlFile, { waitUntil: 'networkidle0' });
 
-      const requiredHeight = await pageIns.evaluate(() => {
-        return document.body.scrollHeight;
-      });
+    const requiredHeight = await pageIns.evaluate(() => document.body.scrollHeight);
+    await pageIns.setViewport({ width: 1280, height: requiredHeight });
 
-      await pageIns.setViewport({ width: 1280, height: requiredHeight });
+    // SELECT PNG DIRECTORY BASED ON ACCESS
+    const pngFile = has_access
+      ? path.join(HAS_ACCESS_PNG_DIR, `${user_sso}_${project_key}_${safe_ts}.png`)
+      : path.join(NO_ACCESS_PNG_DIR, `${user_sso}_${project_key}_${safe_ts}.png`);
 
-      await pageIns.screenshot({ path: pngFile });
+    await pageIns.screenshot({ path: pngFile });
 
-      // Log result
+    // LOG CSV
+    if (has_access) {
       fs.appendFileSync(
         ACCESS_OUTPUT_CSV,
         csvRow([
@@ -308,7 +305,6 @@ async function performAccessCheck() {
         ]) + '\n'
       );
     } else {
-      // NO ACCESS
       fs.appendFileSync(
         NO_ACCESS_OUTPUT_CSV,
         csvRow([
@@ -318,6 +314,7 @@ async function performAccessCheck() {
           access_permission,
           'NO_ACCESS',
           ts,
+          pngFile
         ]) + '\n'
       );
     }
@@ -326,79 +323,54 @@ async function performAccessCheck() {
   if (browser) await browser.close();
 
   console.log('✔ Access verification complete');
-  console.log(`✔ HTML stored under: ${HTML_DIR}`);
-  console.log(`✔ PNG stored under: ${PNG_DIR}`);
 }
 
 // ------------------- Generate DOCX with screenshots -------------------
 
-async function generateDocWithScreenshots() {
-  console.log("Generating DOCX using officegen...");
+async function generateDoc(hasAccessDir, outputFileName) {
+  console.log(`Generating DOCX → ${outputFileName}`);
 
-  const PNG_DIR = path.join(OUTPUT_DIR, "png");
-  const DOC_DIR = path.join(OUTPUT_DIR, "doc");
-  ensureDir(DOC_DIR);
-
-  const pngFiles = fs.readdirSync(PNG_DIR).filter(f => f.endsWith(".png"));
-  if (pngFiles.length === 0) {
-    console.log("No PNG files found — skipping DOC creation.");
+  const images = fs.readdirSync(hasAccessDir).filter(f => f.endsWith(".png"));
+  if (images.length === 0) {
+    console.log(`No screenshots found in ${hasAccessDir}`);
     return;
   }
 
-  // Create DOCX document
-  const docx = officegen('docx');
+  const docx = officegen("docx");
 
-  docx.on('error', (err) => {
-    console.error('officegen error:', err);
-  });
+  docx.on("error", console.error);
 
-  // ---- Title page ----
-  let p = docx.createP({ align: 'center' });
-  p.addText('Bitbucket Access Evidence Collection Report', { bold: true, font_size: 28 });
+  let p = docx.createP({ align: "center" });
+  p.addText(outputFileName.replace(".docx", ""), { bold: true, font_size: 28 });
 
-  docx.createP(); // blank line
+  docx.createP();
+  docx.createP({ align: "center" }).addText(
+    `Generated: ${new Date().toLocaleString()}`,
+    { font_size: 14 }
+  );
 
-  p = docx.createP({ align: 'center' });
-  p.addText(`Generated: ${new Date().toLocaleString()}`, { font_size: 14 });
+  docx.createP().addText("", { pageBreakBefore: true });
 
-  // Page break before screenshots
-  let pb = docx.createP();
-  pb.addText('', { pageBreakBefore: true });
+  images.forEach((file, idx) => {
+    const filePath = path.join(hasAccessDir, file);
 
-  // ---- Screenshots ----
-  pngFiles.forEach((file, idx) => {
-    const filePath = path.join(PNG_DIR, file);
+    let imgP = docx.createP({ align: "center" });
+    imgP.addImage(filePath);
 
-    // Heading above image
-    // let headingP = docx.createP();
-    // headingP.addText(`Screenshot: ${file}`, { bold: true, font_size: 20 });
-
-    // Centered inline image
-    let imgP = docx.createP({ align: 'center' });
-    imgP.addImage(filePath); // officegen embeds as inline picture, not attachment
-
-    // Page break *after* each image except the last
-    if (idx < pngFiles.length - 1) {
-      const br = docx.createP();
-      br.addText('', { pageBreakBefore: true });
+    if (idx < images.length - 1) {
+      docx.createP().addText("", { pageBreakBefore: true });
     }
   });
 
-  const outputPath = path.join(DOC_DIR, 'Bitbucket_Access_Report.docx');
-  ensureDir(DOC_DIR);
-  const out = fs.createWriteStream(outputPath);
+  const outPath = path.join(DOC_DIR, outputFileName);
+  const out = fs.createWriteStream(outPath);
 
   return new Promise((resolve, reject) => {
-    out.on('error', (err) => {
-      console.error('Write stream error:', err);
-      reject(err);
-    });
-
-    out.on('close', () => {
-      console.log(`✔ DOCX generated → ${outputPath}`);
+    out.on("error", reject);
+    out.on("close", () => {
+      console.log(`✔ DOCX generated → ${outPath}`);
       resolve();
     });
-
     docx.generate(out);
   });
 }
@@ -421,7 +393,9 @@ async function main() {
   await performAccessCheck();
 
   // Generate DOC with screenshots
-  await generateDocWithScreenshots();
+    await generateDoc(HAS_ACCESS_PNG_DIR, "Bitbucket_Has_Access_Report.docx");
+    await generateDoc(NO_ACCESS_PNG_DIR, "Bitbucket_No_Access_Report.docx");
+
 }
 
 main().catch((err) => {
