@@ -1,0 +1,5 @@
+Decision Log By,CI ID,Application Name,Manager SSO,User SSO,Account ID,Entitlement Description,Business Role(SIAM),Quarter Review,Decision,Certification Type
+10000001,12345678,Bitbucet,11111111,user1,user1,U : PA-Write,NA,Q32025,Revoked,Manager Access Certification
+10000001,12345678,Bitbucet,11111111,user2,user2,V : PA-Read,NA,Q32025,Revoked,Manager Access Certification
+10000001,12345678,Bitbucet,11111111,user1,user1,V : PB-Read,NA,Q32025,Revoked,Manager Access Certification
+10000001,12345678,Bitbucet,11111111,user3,user3,P : PB-Admin,NA,Q32025,Revoked,Manager Access Certification

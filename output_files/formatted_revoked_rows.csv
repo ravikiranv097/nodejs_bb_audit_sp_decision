@@ -1,0 +1,5 @@
+User SSO,Account ID,Project Key,Access Permission,Decision
+user1,user1,PA,Write,Revoked
+user2,user2,PA,Read,Revoked
+user1,user1,PB,Read,Revoked
+user3,user3,PB,Admin,Revoked

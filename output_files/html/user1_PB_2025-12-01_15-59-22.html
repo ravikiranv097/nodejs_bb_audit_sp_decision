@@ -1,0 +1,41 @@
+
+<html>
+  <body style="font-family: monospace; padding: 20px;">
+    <h2>Bitbucket Access Check</h2>
+    <b>User:</b> user1<br>
+    <b>Project:</b> PB<br>
+    <b>Timestamp:</b> 2025-12-01 15:59:22<br><br>
+
+    <h3>REST API URL</h3>
+    <p>http://localhost:7990/rest/api/1.0/projects/PB/permissions/users?filter=user1</p>
+
+    <h3>API Response</h3>
+    <pre>{
+  "size": 1,
+  "limit": 25,
+  "isLastPage": true,
+  "values": [
+    {
+      "user": {
+        "name": "user1",
+        "emailAddress": "rkvaws1@gmail.com",
+        "active": true,
+        "displayName": "User1",
+        "id": 5,
+        "slug": "user1",
+        "type": "NORMAL",
+        "links": {
+          "self": [
+            {
+              "href": "http://localhost:7990/users/user1"
+            }
+          ]
+        }
+      },
+      "permission": "PROJECT_READ"
+    }
+  ],
+  "start": 0
+}</pre>
+  </body>
+</html>
