@@ -8,8 +8,14 @@ const xlsx = require('xlsx');
 const axios = require('axios');
 const puppeteer = require('puppeteer');
 require('dotenv').config();
-const { Document, Packer, Paragraph, ImageRun } = require("docx");
+// const { Document, Packer, Paragraph, ImageRun } = require("docx");
 const officegen = require('officegen');
+let sharp = null;
+try {
+  sharp = require('sharp');
+} catch (e) {
+  console.warn('`sharp` not installed — PNG trimming will be skipped. Install with `npm install sharp` to enable trimming.');
+}
 
 
 
@@ -38,13 +44,19 @@ ensureDir(NO_ACCESS_PNG_DIR);
 ensureDir(DOC_DIR);
 
 // Bitbucket API config
-const URL = process.env.BB_URL;
+const BB_URL_RAW = (process.env.BB_URL || '').trim();
 const USERNAME = process.env.BB_USERNAME;
 const KEYNAME = process.env.BB_KEYNAME;
 
-if (!URL || !USERNAME || !KEYNAME) {
-  console.error("Missing Bitbucket environment variables. Add them to .env");
+if (!BB_URL_RAW || !USERNAME || !KEYNAME) {
+  console.error("Missing BB_URL, BB_USERNAME or BB_KEYNAME in .env");
   process.exit(1);
+}
+
+// Normalize base URL: ensure protocol and remove trailing slashes
+let BASE_URL = BB_URL_RAW.replace(/\/+$/g, '');
+if (!/^https?:\/\//i.test(BASE_URL)) {
+  BASE_URL = 'http://' + BASE_URL;
 }
 
 
@@ -235,7 +247,7 @@ async function performAccessCheck() {
     const [user_sso, account_id, project_key, access_permission] =
       rows[i].split(',').map(trim);
 
-    const api_url = `http://${URL}/rest/api/1.0/projects/${project_key}/permissions/users?filter=${encodeURIComponent(
+    const api_url = `${BASE_URL}/rest/api/1.0/projects/${encodeURIComponent(project_key)}/permissions/users?filter=${encodeURIComponent(
       user_sso
     )}`;
 
@@ -263,16 +275,30 @@ async function performAccessCheck() {
 
     const html = `
 <html>
-  <body style="font-family: monospace; padding: 20px;">
-    <h2>Bitbucket Access Check</h2>
-    <b>User:</b> ${user_sso}<br>
-    <b>Project:</b> ${project_key}<br>
-    <b>Timestamp:</b> ${ts}<br><br>
+<head>
+  <meta charset="utf-8" />
+    <style>
+    html, body { margin: 0; padding: 0; background: #ffffff; }
+    #evidence { font-family: monospace; padding: 0; margin: 0; display: inline-block; box-sizing: border-box; }
+    h2, h3 { margin: 6px 0; }
+    p { margin: 4px 0; }
+    /* Make pre shrink-wrap so long JSON won't force wide layout */
+    pre { display: inline-block; margin: 0; white-space: pre-wrap; word-break: break-word; max-width: 1200px; }
+    /* Remove forced min-width on labels to avoid extra horizontal space */
+    b { display: inline-block; }
+  </style>
+</head>
+<body>
+  <div id="evidence">
+    <div><b>User:</b> ${user_sso}</div>
+    <div><b>Project:</b> ${project_key}</div>
+    <div><b>Timestamp:</b> ${ts}</div>
     <h3>REST API URL</h3>
     <p>${api_url}</p>
     <h3>API Response</h3>
     <pre>${JSON.stringify(responseData, null, 2)}</pre>
-  </body>
+  </div>
+</body>
 </html>`;
 
     fs.writeFileSync(htmlFile, html);
@@ -288,7 +314,62 @@ async function performAccessCheck() {
       ? path.join(HAS_ACCESS_PNG_DIR, `${user_sso}_${project_key}_${safe_ts}.png`)
       : path.join(NO_ACCESS_PNG_DIR, `${user_sso}_${project_key}_${safe_ts}.png`);
 
-    await pageIns.screenshot({ path: pngFile });
+      const tmpPng = pngFile + '.tmp.png';
+      // Capture full page to temp file and then trim uniform borders using sharp
+      try {
+        await pageIns.screenshot({ path: tmpPng, fullPage: true });
+      } catch (e) {
+        // If fullPage not supported/fails, fallback to viewport screenshot
+        await pageIns.screenshot({ path: tmpPng });
+      }
+
+      if (sharp) {
+        try {
+          // Load raw pixels to compute tight bounding box of non-white content
+          const { data, info } = await sharp(tmpPng).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+          const w = info.width; const h = info.height; const c = info.channels; // channels includes alpha
+          const threshold = 200; // consider pixels darker than near-white as content (tighter)
+
+          let minX = w, minY = h, maxX = 0, maxY = 0;
+          for (let y = 0; y < h; y++) {
+            for (let x = 0; x < w; x++) {
+              const idx = (y * w + x) * c;
+              // check RGB channels (ignore alpha)
+              const r = data[idx];
+              const g = data[idx+1];
+              const b = data[idx+2];
+              if (r < threshold || g < threshold || b < threshold) {
+                if (x < minX) minX = x;
+                if (x > maxX) maxX = x;
+                if (y < minY) minY = y;
+                if (y > maxY) maxY = y;
+              }
+            }
+          }
+
+          if (minX <= maxX && minY <= maxY) {
+            // Add a small outer padding so the PNG has some breathing room
+            const OUTER_PAD = 8; // pixels on each side
+            minX = Math.max(0, minX - OUTER_PAD);
+            minY = Math.max(0, minY - OUTER_PAD);
+            maxX = Math.min(w - 1, maxX + OUTER_PAD);
+            maxY = Math.min(h - 1, maxY + OUTER_PAD);
+
+            const extractW = maxX - minX + 1;
+            const extractH = maxY - minY + 1;
+            await sharp(tmpPng).extract({ left: minX, top: minY, width: extractW, height: extractH }).toFile(pngFile);
+            fs.unlinkSync(tmpPng);
+          } else {
+            // nothing detected, fallback to trim
+            await sharp(tmpPng).trim().toFile(pngFile);
+            fs.unlinkSync(tmpPng);
+          }
+        } catch (e) {
+          try { fs.renameSync(tmpPng, pngFile); } catch (_) { /* ignore */ }
+        }
+      } else {
+        try { fs.renameSync(tmpPng, pngFile); } catch (_) { /* ignore */ }
+      }
 
     // LOG CSV
     if (has_access) {
