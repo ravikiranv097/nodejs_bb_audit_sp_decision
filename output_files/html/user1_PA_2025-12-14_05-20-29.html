@@ -15,11 +15,11 @@
 </head>
 <body>
   <div id="evidence">
-    <div><b>User:</b> user2</div>
+    <div><b>User:</b> user1</div>
     <div><b>Project:</b> PA</div>
-    <div><b>Timestamp:</b> 2025-12-05 02:25:02</div>
+    <div><b>Timestamp:</b> 2025-12-14 05:20:29</div>
     <h3>REST API URL</h3>
-    <p>http://localhost:7990/rest/api/1.0/projects/PA/permissions/users?filter=user2</p>
+    <p>http://localhost:7990/rest/api/1.0/projects/PA/permissions/users?filter=user1</p>
     <h3>API Response</h3>
     <pre>{
   "size": 1,
@@ -28,22 +28,22 @@
   "values": [
     {
       "user": {
-        "name": "user2",
-        "emailAddress": "rkvaws2@gmail.com",
+        "name": "user1",
+        "emailAddress": "user1@g.com",
         "active": true,
-        "displayName": "User2",
-        "id": 6,
-        "slug": "user2",
+        "displayName": "User1",
+        "id": 4,
+        "slug": "user1",
         "type": "NORMAL",
         "links": {
           "self": [
             {
-              "href": "http://localhost:7990/users/user2"
+              "href": "http://localhost:7990/users/user1"
             }
           ]
         }
       },
-      "permission": "PROJECT_READ"
+      "permission": "PROJECT_WRITE"
     }
   ],
   "start": 0

@@ -1,0 +1,8 @@
+allowlist_paths:
+  - output_files/**
+  - input_files/**
+  - screenshots/**
+  - "*.png"
+  - "*.csv"
+  - "*.docx"
+  - "*.html"

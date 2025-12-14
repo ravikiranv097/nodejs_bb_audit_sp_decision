@@ -1,0 +1,53 @@
+
+<html>
+<head>
+  <meta charset="utf-8" />
+    <style>
+    html, body { margin: 0; padding: 0; background: #ffffff; }
+    #evidence { font-family: monospace; padding: 0; margin: 0; display: inline-block; box-sizing: border-box; }
+    h2, h3 { margin: 6px 0; }
+    p { margin: 4px 0; }
+    /* Make pre shrink-wrap so long JSON won't force wide layout */
+    pre { display: inline-block; margin: 0; white-space: pre-wrap; word-break: break-word; max-width: 1200px; }
+    /* Remove forced min-width on labels to avoid extra horizontal space */
+    b { display: inline-block; }
+  </style>
+</head>
+<body>
+  <div id="evidence">
+    <div><b>User:</b> user3</div>
+    <div><b>Project:</b> PB</div>
+    <div><b>Timestamp:</b> 2025-12-14 05:20:35</div>
+    <h3>REST API URL</h3>
+    <p>http://localhost:7990/rest/api/1.0/projects/PB/permissions/users?filter=user3</p>
+    <h3>API Response</h3>
+    <pre>{
+  "size": 1,
+  "limit": 25,
+  "isLastPage": true,
+  "values": [
+    {
+      "user": {
+        "name": "user3",
+        "emailAddress": "user3@g.com",
+        "active": true,
+        "displayName": "User3",
+        "id": 6,
+        "slug": "user3",
+        "type": "NORMAL",
+        "links": {
+          "self": [
+            {
+              "href": "http://localhost:7990/users/user3"
+            }
+          ]
+        }
+      },
+      "permission": "PROJECT_ADMIN"
+    }
+  ],
+  "start": 0
+}</pre>
+  </div>
+</body>
+</html>

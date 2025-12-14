@@ -1,3 +1,5 @@
 Username,Account ID,Project Key,Access Permission,Access Status,Timestamp,Screenshot File
-user2,user2,PA,Read,HAS_ACCESS,2025-12-05 02:25:02,/home/user/Documents/FINAL/NODEJS/sp_testing/output_files/png/has_access/user2_PA_2025-12-05_02-25-02.png
-user1,user1,PB,Read,HAS_ACCESS,2025-12-05 02:25:04,/home/user/Documents/FINAL/NODEJS/sp_testing/output_files/png/has_access/user1_PB_2025-12-05_02-25-04.png
+user1,user1,PA,Write,HAS_ACCESS,2025-12-14 05:20:29,/home/ravikiran/Documents/bitbucket/audit/nodejs_bb_audit_sp_decision/output_files/png/has_access/user1_PA_2025-12-14_05-20-29.png
+user2,user2,PA,Read,HAS_ACCESS,2025-12-14 05:20:31,/home/ravikiran/Documents/bitbucket/audit/nodejs_bb_audit_sp_decision/output_files/png/has_access/user2_PA_2025-12-14_05-20-31.png
+user1,user1,PB,Read,HAS_ACCESS,2025-12-14 05:20:34,/home/ravikiran/Documents/bitbucket/audit/nodejs_bb_audit_sp_decision/output_files/png/has_access/user1_PB_2025-12-14_05-20-34.png
+user3,user3,PB,Admin,HAS_ACCESS,2025-12-14 05:20:35,/home/ravikiran/Documents/bitbucket/audit/nodejs_bb_audit_sp_decision/output_files/png/has_access/user3_PB_2025-12-14_05-20-35.png
