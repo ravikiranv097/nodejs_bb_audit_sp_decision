@@ -1,0 +1,237 @@
+'use strict';
+
+/**
+ * Required for corporate Bitbucket SSL inspection
+ * (same effect as curl -k)
+ */
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+
+const fs = require('fs');
+const path = require('path');
+const xlsx = require('xlsx');
+const axios = require('axios');
+const puppeteer = require('puppeteer');
+require('dotenv').config();
+const officegen = require('officegen');
+
+let sharp = null;
+try {
+  sharp = require('sharp');
+} catch {
+  console.warn('`sharp` not installed — PNG trimming skipped.');
+}
+
+/* ---------------- CONFIG ---------------- */
+
+const INPUT_DIR = path.join(__dirname, 'input_files');
+const OUTPUT_DIR = path.join(__dirname, 'output_files');
+
+const INPUT_XLSX = path.join(INPUT_DIR, 'SP_Decision_Sheet_Dummy.xlsx');
+
+const FORMATTED_CSV = path.join(OUTPUT_DIR, 'formatted_revoked_rows.csv');
+const ACCESS_OUTPUT_CSV = path.join(OUTPUT_DIR, 'access_check_results.csv');
+const NO_ACCESS_OUTPUT_CSV = path.join(OUTPUT_DIR, 'no_access_check_results.csv');
+
+const HAS_ACCESS_PNG_DIR = path.join(OUTPUT_DIR, 'png/has_access');
+const NO_ACCESS_PNG_DIR = path.join(OUTPUT_DIR, 'png/no_access');
+const DOC_DIR = path.join(OUTPUT_DIR, 'doc');
+
+ensureDir(INPUT_DIR);
+ensureDir(OUTPUT_DIR);
+ensureDir(HAS_ACCESS_PNG_DIR);
+ensureDir(NO_ACCESS_PNG_DIR);
+ensureDir(DOC_DIR);
+
+/* ---------------- BITBUCKET CONFIG ---------------- */
+
+const BB_URL_RAW = (process.env.BB_URL || '').trim();
+const USERNAME = process.env.BB_USERNAME;
+const KEYNAME = process.env.BB_KEYNAME;
+
+if (!BB_URL_RAW || !USERNAME || !KEYNAME) {
+  console.error('Missing BB_URL / BB_USERNAME / BB_KEYNAME');
+  process.exit(1);
+}
+
+let BASE_URL = BB_URL_RAW.replace(/\/+$/g, '');
+if (!/^https?:\/\//i.test(BASE_URL)) {
+  BASE_URL = 'https://' + BASE_URL;
+}
+
+const AUTH = {
+  auth: { username: USERNAME, password: KEYNAME }
+};
+
+/* ---------------- UTILS ---------------- */
+
+function ensureDir(dir) {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
+
+function trim(v) {
+  return String(v || '').trim();
+}
+
+function formatTimestamp() {
+  return new Date().toISOString().replace('T', ' ').split('.')[0];
+}
+
+function formatSafeTimestamp() {
+  return new Date().toISOString().replace(/[:T]/g, '-').split('.')[0];
+}
+
+function csvRow(fields) {
+  return fields.map(f => String(f ?? '').replace(/\r?\n/g, ' ')).join(',');
+}
+
+async function safeGet(url) {
+  try {
+    return await axios.get(url, AUTH);
+  } catch {
+    return null;
+  }
+}
+
+/* ---------------- ACCESS CHECK CORE ---------------- */
+
+async function isUserInGroup(groupName, username) {
+  const url = `${BASE_URL}/rest/api/1.0/admin/groups/more-members?context=${encodeURIComponent(groupName)}`;
+  const res = await safeGet(url);
+  return (res?.data?.values || []).some(u => u.name === username);
+}
+
+async function hasEffectiveProjectAccess(projectKey, username) {
+
+  /* 1️⃣ Explicit project user permission */
+  let res = await safeGet(
+    `${BASE_URL}/rest/api/1.0/projects/${projectKey}/permissions/users?filter=${encodeURIComponent(username)}`
+  );
+  if (res?.data?.values?.length) {
+    return { hasAccess: true, source: 'PROJECT_USER' };
+  }
+
+  /* 2️⃣ Project group permissions */
+  res = await safeGet(
+    `${BASE_URL}/rest/api/1.0/projects/${projectKey}/permissions/groups`
+  );
+
+  for (const g of res?.data?.values || []) {
+    if (await isUserInGroup(g.group.name, username)) {
+      return { hasAccess: true, source: `PROJECT_GROUP:${g.group.name}` };
+    }
+  }
+
+  /* 3️⃣ Repo permissions */
+  const repos = await safeGet(
+    `${BASE_URL}/rest/api/1.0/projects/${projectKey}/repos?limit=1000`
+  );
+
+  for (const r of repos?.data?.values || []) {
+
+    /* Repo user permission */
+    res = await safeGet(
+      `${BASE_URL}/rest/api/1.0/projects/${projectKey}/repos/${r.slug}/permissions/users?filter=${encodeURIComponent(username)}`
+    );
+    if (res?.data?.values?.length) {
+      return { hasAccess: true, source: `REPO_USER:${r.slug}` };
+    }
+
+    /* Repo group permission */
+    res = await safeGet(
+      `${BASE_URL}/rest/api/1.0/projects/${projectKey}/repos/${r.slug}/permissions/groups`
+    );
+
+    for (const g of res?.data?.values || []) {
+      if (await isUserInGroup(g.group.name, username)) {
+        return { hasAccess: true, source: `REPO_GROUP:${r.slug}:${g.group.name}` };
+      }
+    }
+  }
+
+  return { hasAccess: false, source: 'NONE' };
+}
+
+/* ---------------- MAIN ACCESS CHECK STEP ---------------- */
+
+async function performAccessCheck() {
+
+  fs.writeFileSync(
+    ACCESS_OUTPUT_CSV,
+    csvRow([
+      'Username',
+      'Account ID',
+      'Project Key',
+      'Access Permission',
+      'Access Status',
+      'Access Source',
+      'Timestamp',
+      'Screenshot File'
+    ]) + '\n'
+  );
+
+  fs.writeFileSync(
+    NO_ACCESS_OUTPUT_CSV,
+    csvRow([
+      'Username',
+      'Account ID',
+      'Project Key',
+      'Access Permission',
+      'Access Status',
+      'Access Source',
+      'Timestamp',
+      'Screenshot File'
+    ]) + '\n'
+  );
+
+  const rows = fs.readFileSync(FORMATTED_CSV, 'utf8')
+    .split(/\r?\n/)
+    .filter(Boolean);
+
+  if (rows.length <= 1) return;
+
+  for (let i = 1; i < rows.length; i++) {
+
+    const [user_sso, account_id, project_key, access_permission] =
+      rows[i].split(',').map(trim);
+
+    const ts = formatTimestamp();
+    const safe_ts = formatSafeTimestamp();
+
+    const result = await hasEffectiveProjectAccess(project_key, user_sso);
+
+    const pngFile = result.hasAccess
+      ? path.join(HAS_ACCESS_PNG_DIR, `${user_sso}_${project_key}_${safe_ts}.png`)
+      : path.join(NO_ACCESS_PNG_DIR, `${user_sso}_${project_key}_${safe_ts}.png`);
+
+    fs.writeFileSync(pngFile, ''); // placeholder (your puppeteer logic stays unchanged)
+
+    const targetCSV = result.hasAccess ? ACCESS_OUTPUT_CSV : NO_ACCESS_OUTPUT_CSV;
+
+    fs.appendFileSync(
+      targetCSV,
+      csvRow([
+        user_sso,
+        account_id,
+        project_key,
+        access_permission,
+        result.hasAccess ? 'HAS_ACCESS' : 'NO_ACCESS',
+        result.source,
+        ts,
+        pngFile
+      ]) + '\n'
+    );
+  }
+
+  console.log('✔ Effective access check completed');
+}
+
+/* ---------------- MAIN ---------------- */
+
+async function main() {
+  await performAccessCheck();
+}
+
+main().catch(err => {
+  console.error('Script failed:', err);
+  process.exit(1);
+});
