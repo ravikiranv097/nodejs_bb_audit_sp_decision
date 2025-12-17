@@ -1,0 +1,175 @@
+'use strict';
+
+/* =========================================================
+   REQUIRED for corporate Bitbucket SSL inspection
+   (equivalent to curl -k)
+========================================================= */
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+
+const fs = require('fs');
+const path = require('path');
+const xlsx = require('xlsx');
+const axios = require('axios');
+const puppeteer = require('puppeteer');
+require('dotenv').config();
+const officegen = require('officegen');
+
+let sharp = null;
+try { sharp = require('sharp'); } catch {}
+
+/* ==================== CONFIG ==================== */
+
+const INPUT_DIR = path.join(__dirname, 'input_files');
+const OUTPUT_DIR = path.join(__dirname, 'output_files');
+const INPUT_XLSX = path.join(INPUT_DIR, 'SP_Decision_Sheet_Dummy.xlsx');
+
+const FORMATTED_CSV = path.join(OUTPUT_DIR, 'formatted_revoked_rows.csv');
+const ACCESS_OUTPUT_CSV = path.join(OUTPUT_DIR, 'access_check_results.csv');
+const NO_ACCESS_OUTPUT_CSV = path.join(OUTPUT_DIR, 'no_access_check_results.csv');
+
+const HAS_ACCESS_PNG_DIR = path.join(OUTPUT_DIR, 'png/has_access');
+const NO_ACCESS_PNG_DIR = path.join(OUTPUT_DIR, 'png/no_access');
+const DOC_DIR = path.join(OUTPUT_DIR, 'doc');
+
+ensureDir(INPUT_DIR);
+ensureDir(OUTPUT_DIR);
+ensureDir(HAS_ACCESS_PNG_DIR);
+ensureDir(NO_ACCESS_PNG_DIR);
+ensureDir(DOC_DIR);
+
+/* ================= BITBUCKET ================= */
+
+const BB_URL_RAW = (process.env.BB_URL || '').trim();
+const USERNAME = process.env.BB_USERNAME;
+const KEYNAME = process.env.BB_KEYNAME;
+
+if (!BB_URL_RAW || !USERNAME || !KEYNAME) {
+  console.error('Missing BB_URL / BB_USERNAME / BB_KEYNAME');
+  process.exit(1);
+}
+
+let BASE_URL = BB_URL_RAW.replace(/\/+$/g, '');
+if (!/^https?:\/\//i.test(BASE_URL)) BASE_URL = 'https://' + BASE_URL;
+
+const AUTH = { auth: { username: USERNAME, password: KEYNAME } };
+
+/* ================= UTILS ================= */
+
+function ensureDir(dir) {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
+const trim = v => String(v || '').trim();
+const csvRow = a => a.map(v => String(v ?? '').replace(/\r?\n/g, ' ')).join(',');
+const ts = () => new Date().toISOString().replace('T', ' ').split('.')[0];
+const safeTs = () => new Date().toISOString().replace(/[:T]/g, '-').split('.')[0];
+
+async function safeGet(url) {
+  try { return await axios.get(url, AUTH); }
+  catch { return null; }
+}
+
+/* ================= ACCESS LOGIC ================= */
+
+async function isUserInGroup(group, user) {
+  const res = await safeGet(
+    `${BASE_URL}/rest/api/1.0/admin/groups/more-members?context=${encodeURIComponent(group)}`
+  );
+  return (res?.data?.values || []).some(u => u.name === user);
+}
+
+async function hasEffectiveProjectAccess(projectKey, user) {
+
+  // 1. Project user
+  let r = await safeGet(
+    `${BASE_URL}/rest/api/1.0/projects/${projectKey}/permissions/users?filter=${encodeURIComponent(user)}`
+  );
+  if (r?.data?.values?.length)
+    return { hasAccess: true, source: 'PROJECT_USER' };
+
+  // 2. Project group
+  r = await safeGet(
+    `${BASE_URL}/rest/api/1.0/projects/${projectKey}/permissions/groups`
+  );
+  for (const g of r?.data?.values || []) {
+    if (await isUserInGroup(g.group.name, user))
+      return { hasAccess: true, source: `PROJECT_GROUP:${g.group.name}` };
+  }
+
+  // 3. Repo access
+  const repos = await safeGet(
+    `${BASE_URL}/rest/api/1.0/projects/${projectKey}/repos?limit=1000`
+  );
+
+  for (const repo of repos?.data?.values || []) {
+
+    // Repo user
+    r = await safeGet(
+      `${BASE_URL}/rest/api/1.0/projects/${projectKey}/repos/${repo.slug}/permissions/users?filter=${encodeURIComponent(user)}`
+    );
+    if (r?.data?.values?.length)
+      return { hasAccess: true, source: `REPO_USER:${repo.slug}` };
+
+    // Repo group
+    r = await safeGet(
+      `${BASE_URL}/rest/api/1.0/projects/${projectKey}/repos/${repo.slug}/permissions/groups`
+    );
+    for (const g of r?.data?.values || []) {
+      if (await isUserInGroup(g.group.name, user))
+        return { hasAccess: true, source: `REPO_GROUP:${repo.slug}:${g.group.name}` };
+    }
+  }
+
+  return { hasAccess: false, source: 'NONE' };
+}
+
+/* ================= STEP 4 ================= */
+
+async function performAccessCheck() {
+
+  fs.writeFileSync(
+    ACCESS_OUTPUT_CSV,
+    csvRow(['Username','Account ID','Project Key','Access','Status','Source','Timestamp','Screenshot']) + '\n'
+  );
+  fs.writeFileSync(
+    NO_ACCESS_OUTPUT_CSV,
+    csvRow(['Username','Account ID','Project Key','Access','Status','Source','Timestamp','Screenshot']) + '\n'
+  );
+
+  const rows = fs.readFileSync(FORMATTED_CSV,'utf8').split(/\r?\n/).filter(Boolean);
+  if (rows.length <= 1) return;
+
+  const browser = await puppeteer.launch({ headless: true });
+  const page = await browser.newPage();
+
+  for (let i = 1; i < rows.length; i++) {
+    const [user, acc, proj, perm] = rows[i].split(',').map(trim);
+
+    const result = await hasEffectiveProjectAccess(proj, user);
+    const stamp = ts();
+    const safe = safeTs();
+
+    const html = `<pre>User: ${user}\nProject: ${proj}\nAccess: ${result.hasAccess}\nSource: ${result.source}</pre>`;
+    const htmlFile = path.join(OUTPUT_DIR, `${user}_${proj}_${safe}.html`);
+    fs.writeFileSync(htmlFile, html);
+
+    await page.goto('file://' + htmlFile);
+    const png = result.hasAccess
+      ? path.join(HAS_ACCESS_PNG_DIR, `${user}_${proj}_${safe}.png`)
+      : path.join(NO_ACCESS_PNG_DIR, `${user}_${proj}_${safe}.png`);
+    await page.screenshot({ path: png, fullPage: true });
+
+    fs.appendFileSync(
+      result.hasAccess ? ACCESS_OUTPUT_CSV : NO_ACCESS_OUTPUT_CSV,
+      csvRow([user, acc, proj, perm, result.hasAccess?'HAS_ACCESS':'NO_ACCESS', result.source, stamp, png]) + '\n'
+    );
+  }
+
+  await browser.close();
+  console.log('✔ Access check complete');
+}
+
+/* ================= MAIN ================= */
+
+(async () => {
+  await performAccessCheck();
+})();
