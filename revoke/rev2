@@ -1,0 +1,280 @@
+'use strict';
+
+/* ================= IMPORTS ================= */
+
+const fs = require('fs');
+const path = require('path');
+const xlsx = require('xlsx');
+const axios = require('axios');
+const puppeteer = require('puppeteer');
+const officegen = require('officegen');
+const winston = require('winston');
+require('dotenv').config();
+
+/* ================= CONFIG ================= */
+
+const INPUT_DIR = path.join(__dirname, 'input_files');
+const OUTPUT_DIR = path.join(__dirname, 'output_files');
+const LOG_DIR = path.join(OUTPUT_DIR, 'logs');
+const DOC_DIR = path.join(OUTPUT_DIR, 'doc');
+
+const INPUT_XLSX = path.join(
+  INPUT_DIR,
+  'Bitbucket_OrphanDecisions_Q32025.xlsx'
+);
+
+const HAS_ACCESS_PNG_DIR = path.join(OUTPUT_DIR, 'png/has_access');
+const NO_ACCESS_PNG_DIR = path.join(OUTPUT_DIR, 'png/no_access');
+
+const ACCESS_OUTPUT_CSV = path.join(
+  OUTPUT_DIR,
+  'access_check_results.csv'
+);
+
+const BASE_URL = process.env.BB_URL?.replace(/\/+$/, '');
+const USERNAME = process.env.BB_USERNAME;
+const PASSWORD = process.env.BB_AUDIT_PWD;
+
+if (!BASE_URL || !USERNAME || !PASSWORD) {
+  console.error('❌ Missing Bitbucket credentials');
+  process.exit(1);
+}
+
+/* ================= UTILS ================= */
+
+const ensureDir = d => !fs.existsSync(d) && fs.mkdirSync(d, { recursive: true });
+const trim = v => String(v || '').trim();
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function tsIST() {
+  return new Intl.DateTimeFormat('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    dateStyle: 'short',
+    timeStyle: 'medium',
+    hour12: false
+  }).format(new Date());
+}
+
+function safeTsIST() {
+  return tsIST().replace(/[^\d]/g, '-');
+}
+
+function extractProjectKey(entitlement) {
+  if (!entitlement) return '';
+  const right = entitlement.split(':')[1];
+  return right ? right.split('-')[0].trim() : '';
+}
+
+/* ================= DIRS ================= */
+
+[
+  OUTPUT_DIR,
+  LOG_DIR,
+  DOC_DIR,
+  HAS_ACCESS_PNG_DIR,
+  NO_ACCESS_PNG_DIR
+].forEach(ensureDir);
+
+/* ================= LOGGER ================= */
+
+const logger = winston.createLogger({
+  transports: [
+    new winston.transports.Console(),
+    new winston.transports.File({ filename: path.join(LOG_DIR, 'audit.log') })
+  ]
+});
+
+/* ================= BITBUCKET CLIENT ================= */
+
+class BitbucketClient {
+  async req(method, url) {
+    try {
+      const r = await axios({
+        method,
+        url,
+        auth: { username: USERNAME, password: PASSWORD }
+      });
+      return r.data;
+    } catch (e) {
+      logger.error(`API ${method.toUpperCase()} failed: ${url}`);
+      return null;
+    }
+  }
+}
+
+/* ================= PERMISSION RESOLVER ================= */
+
+class PermissionResolver {
+  constructor(bb) {
+    this.bb = bb;
+  }
+
+  async userInGroup(group, user) {
+    const d = await this.bb.req(
+      'get',
+      `${BASE_URL}/rest/api/1.0/admin/groups/more-members` +
+      `?context=${encodeURIComponent(group)}` +
+      `&filter=${encodeURIComponent(user)}`
+    );
+    return !!d?.values?.length;
+  }
+
+  async checkProjectUser(project, user) {
+    const d = await this.bb.req(
+      'get',
+      `${BASE_URL}/rest/api/1.0/projects/${project}/permissions/users?filter=${user}`
+    );
+    if (d?.values?.length) {
+      return { hasAccess: true, level: 'PROJECT', source: 'PROJECT_USER' };
+    }
+    return null;
+  }
+
+  async checkProjectGroup(project, user) {
+    const d = await this.bb.req(
+      'get',
+      `${BASE_URL}/rest/api/1.0/projects/${project}/permissions/groups`
+    );
+    if (!d?.values) return null;
+
+    for (const g of d.values) {
+      if (await this.userInGroup(g.group.name, user)) {
+        return {
+          hasAccess: true,
+          level: 'PROJECT',
+          source: 'PROJECT_GROUP',
+          group: g.group.name
+        };
+      }
+    }
+    return null;
+  }
+
+  async checkRepoUser(project, user) {
+    const repos = await this.bb.req(
+      'get',
+      `${BASE_URL}/rest/api/1.0/projects/${project}/repos?limit=100`
+    );
+    if (!repos?.values) return null;
+
+    for (const r of repos.values) {
+      const d = await this.bb.req(
+        'get',
+        `${BASE_URL}/rest/api/1.0/projects/${project}` +
+        `/repos/${r.slug}/permissions/users?filter=${user}`
+      );
+      if (d?.values?.length) {
+        return {
+          hasAccess: true,
+          level: 'REPO',
+          source: 'REPO_USER',
+          repo: r.slug
+        };
+      }
+    }
+    return null;
+  }
+
+  async resolve(project, user) {
+    return (
+      await this.checkProjectUser(project, user) ||
+      await this.checkProjectGroup(project, user) ||
+      await this.checkRepoUser(project, user) ||
+      { hasAccess: false }
+    );
+  }
+}
+
+/* ================= REVOKE (FIXED & SAFE) ================= */
+
+async function revoke(bb, res, project, user) {
+
+  // 1️⃣ Project → Direct User
+  if (res.source === 'PROJECT_USER') {
+    await bb.req(
+      'delete',
+      `${BASE_URL}/rest/api/1.0/projects/${project}/permissions/users?name=${user}`
+    );
+    return;
+  }
+
+  // 2️⃣ Project → Group → REMOVE USER FROM GROUP (NOT group from project)
+  if (res.source === 'PROJECT_GROUP') {
+    await bb.req(
+      'delete',
+      `${BASE_URL}/rest/api/1.0/admin/groups/remove-user` +
+      `?context=${encodeURIComponent(res.group)}` +
+      `&name=${encodeURIComponent(user)}`
+    );
+    return;
+  }
+
+  // 3️⃣ Repo → Direct User
+  if (res.source === 'REPO_USER') {
+    await bb.req(
+      'delete',
+      `${BASE_URL}/rest/api/1.0/projects/${project}` +
+      `/repos/${res.repo}/permissions/users?name=${user}`
+    );
+  }
+}
+
+/* ================= MAIN ================= */
+
+(async () => {
+  logger.info('Bitbucket access audit started');
+
+  const wb = xlsx.readFile(INPUT_XLSX);
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const rows = xlsx.utils.sheet_to_json(ws, { defval: '' });
+
+  const bb = new BitbucketClient();
+  const resolver = new PermissionResolver(bb);
+
+  const browser = await puppeteer.launch({ headless: true });
+  const page = await browser.newPage();
+
+  fs.writeFileSync(
+    ACCESS_OUTPUT_CSV,
+    'User,AccountID,Project,Access,Level,Source,Timestamp,Screenshot\n'
+  );
+
+  for (const r of rows) {
+    const user = trim(r['User SSO']);
+    const accountId = trim(r['Account ID']);
+    const project = extractProjectKey(r['Entitlement Description']);
+
+    if (!user || !project) continue;
+
+    logger.info(`Checking ${user} on ${project}`);
+
+    let res = await resolver.resolve(project, user);
+
+    if (res.hasAccess) {
+      await revoke(bb, res, project, user);
+      await sleep(500);
+      res = await resolver.resolve(project, user);
+    }
+
+    const png = path.join(
+      res.hasAccess ? HAS_ACCESS_PNG_DIR : NO_ACCESS_PNG_DIR,
+      `${user}_${project}_${safeTsIST()}.png`
+    );
+
+    await page.setContent(
+      `<h3>${user} | ${project}</h3><pre>${JSON.stringify(res, null, 2)}</pre>`
+    );
+    await page.screenshot({ path: png });
+
+    fs.appendFileSync(
+      ACCESS_OUTPUT_CSV,
+      `${user},${accountId},${project},` +
+      `${res.hasAccess ? 'YES' : 'NO'},` +
+      `${res.level || ''},${res.source || ''},` +
+      `${tsIST()},${png}\n`
+    );
+  }
+
+  await browser.close();
+  logger.info('Bitbucket audit completed');
+})();
