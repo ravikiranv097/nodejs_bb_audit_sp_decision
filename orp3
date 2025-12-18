@@ -1,0 +1,363 @@
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const xlsx = require('xlsx');
+const axios = require('axios');
+const puppeteer = require('puppeteer');
+const officegen = require('officegen');
+const winston = require('winston');
+require('dotenv').config();
+
+/* ================= CONFIG ================= */
+
+const INPUT_DIR = path.join(__dirname, 'input_files');
+const OUTPUT_DIR = path.join(__dirname, 'output_files');
+const LOG_DIR = path.join(OUTPUT_DIR, 'logs');
+const DOC_DIR = path.join(OUTPUT_DIR, 'doc');
+
+const INPUT_XLSX = path.join(
+  INPUT_DIR,
+  'Bitbucket_OrphanDecisions_Q32025.xlsx'
+);
+
+const UNIQUE_SSO_CSV = path.join(
+  OUTPUT_DIR,
+  'unique_sso_extracted.csv'
+);
+
+const USER_PROJECT_CSV = path.join(
+  OUTPUT_DIR,
+  'user_sso_project_code_extracted.csv'
+);
+
+const HAS_ACCESS_PNG_DIR = path.join(OUTPUT_DIR, 'png', 'has_access');
+const NO_ACCESS_PNG_DIR = path.join(OUTPUT_DIR, 'png', 'no_access');
+
+const ACCESS_OUTPUT_CSV = path.join(OUTPUT_DIR, 'access_check_results.csv');
+const NO_ACCESS_OUTPUT_CSV = path.join(OUTPUT_DIR, 'no_access_check_results.csv');
+
+const BASE_URL = process.env.BB_URL?.replace(/\/+$/, '');
+const USERNAME = process.env.BB_USERNAME;
+const PASSWORD = process.env.BB_AUDIT_PWD;
+
+if (!BASE_URL || !USERNAME || !PASSWORD) {
+  console.error('❌ Missing Bitbucket credentials');
+  process.exit(1);
+}
+
+/* ================= UTILS ================= */
+
+const ensureDir = d => {
+  if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
+};
+
+const trim = v => String(v || '').trim();
+
+function tsIST() {
+  return new Intl.DateTimeFormat('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  }).format(new Date()).replace(',', '');
+}
+
+function safeTsIST() {
+  return tsIST().replace(/[^\d]/g, '-');
+}
+
+/** CSV + Windows filename safe */
+function cleanCsvValue(v) {
+  return String(v || '')
+    .trim()
+    .replace(/^"+|"+$/g, '')
+    .replace(/[<>:"/\\|?*]/g, '_');
+}
+
+/** Extract project key from Entitlement Description */
+function extractProjectKey(entitlement) {
+  if (!entitlement) return '';
+  const right = entitlement.split(':')[1];
+  return right ? right.split('-')[0].trim() : '';
+}
+
+/* ================= DIRS ================= */
+
+[
+  OUTPUT_DIR,
+  LOG_DIR,
+  DOC_DIR,
+  HAS_ACCESS_PNG_DIR,
+  NO_ACCESS_PNG_DIR
+].forEach(ensureDir);
+
+/* ================= LOGGER ================= */
+
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.timestamp({ format: () => tsIST() }),
+  transports: [
+    new winston.transports.Console({
+      format: winston.format.printf(
+        ({ timestamp, level, message }) =>
+          `${timestamp} [${level}] ${message}`
+      )
+    }),
+    new winston.transports.File({
+      filename: path.join(LOG_DIR, 'audit-info.log')
+    }),
+    new winston.transports.File({
+      filename: path.join(LOG_DIR, 'audit-error.log'),
+      level: 'error'
+    })
+  ]
+});
+
+/* ================= PRE-PROCESSING ================= */
+
+/**
+ * STEP 1:
+ * Extract unique User SSO (first occurrence)
+ */
+function extractUniqueSSOFromExcel() {
+  const wb = xlsx.readFile(INPUT_XLSX);
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const rows = xlsx.utils.sheet_to_json(ws, { defval: '' });
+
+  const seen = new Set();
+  const uniqueRows = [];
+
+  for (const r of rows) {
+    const user = trim(r['User SSO']);
+    if (!user || seen.has(user)) continue;
+    seen.add(user);
+    uniqueRows.push(r);
+  }
+
+  const headers = Object.keys(uniqueRows[0]);
+  const out = [
+    headers.join(','),
+    ...uniqueRows.map(r =>
+      headers.map(h => `"${String(r[h]).replace(/"/g, '""')}"`).join(',')
+    )
+  ];
+
+  fs.writeFileSync(UNIQUE_SSO_CSV, out.join('\n'));
+  logger.info(`Unique SSO extracted: ${uniqueRows.length}`);
+}
+
+/**
+ * STEP 2:
+ * Extract User SSO (D), Account ID (H), Project from Entitlement (I)
+ */
+function extractUserProjectCSV() {
+  const lines = fs.readFileSync(UNIQUE_SSO_CSV, 'utf8').split('\n');
+
+  // Remove header row
+  lines.shift();
+
+  /**
+   * Column index mapping (0-based)
+   * D -> 3  : User SSO
+   * H -> 7  : Account ID
+   * I -> 8  : Entitlement Description
+   */
+  const IDX_USER = 3;
+  const IDX_ACC = 7;
+  const IDX_ENT = 8;
+
+  const out = ['User SSO,Account ID,Project'];
+
+  for (const l of lines) {
+    if (!l.trim()) continue;
+
+    const cols = l.split(',');
+
+    const user = cleanCsvValue(cols[IDX_USER]);
+    const acc = cleanCsvValue(cols[IDX_ACC]);
+    const entitlement = cleanCsvValue(cols[IDX_ENT]);
+
+    const project = extractProjectKey(entitlement);
+
+    if (user && project) {
+      out.push(`${user},${acc},${project}`);
+    }
+  }
+
+  fs.writeFileSync(USER_PROJECT_CSV, out.join('\n'));
+  logger.info(`User + Project CSV created (${out.length - 1} rows)`);
+}
+
+/* ================= BITBUCKET CLIENT ================= */
+
+class BitbucketClient {
+  constructor() {
+    this.queue = [];
+    this.active = 0;
+    this.MAX = 5;
+  }
+
+  async get(url) {
+    return new Promise(resolve => {
+      this.queue.push({ url, resolve });
+      this._next();
+    });
+  }
+
+  async _next() {
+    if (this.active >= this.MAX || !this.queue.length) return;
+    const job = this.queue.shift();
+    this.active++;
+
+    try {
+      const r = await axios.get(job.url, {
+        auth: { username: USERNAME, password: PASSWORD }
+      });
+      job.resolve(r.data);
+    } catch {
+      logger.error(`API error | ${job.url}`);
+      job.resolve(null);
+    } finally {
+      this.active--;
+      this._next();
+    }
+  }
+}
+
+/* ================= PERMISSION RESOLVER ================= */
+
+class PermissionResolver {
+  constructor(bb) {
+    this.bb = bb;
+    this.groupCache = new Map();
+  }
+
+  async inGroup(group, user) {
+    const key = `${group}:${user}`;
+    if (this.groupCache.has(key)) return this.groupCache.get(key);
+
+    const url =
+      `${BASE_URL}/rest/api/1.0/admin/groups/more-members?context=${encodeURIComponent(group)}&filter=${encodeURIComponent(user)}`;
+
+    const d = await this.bb.get(url);
+    const ok = d?.values?.length > 0;
+    this.groupCache.set(key, ok);
+    return ok;
+  }
+
+  async checkProject(project, user) {
+    let url = `${BASE_URL}/rest/api/1.0/projects/${project}/permissions/users?filter=${user}`;
+    let d = await this.bb.get(url);
+
+    if (d?.values?.length) {
+      return { hasAccess: true, level: d.values[0].permission, source: 'PROJECT_USER' };
+    }
+
+    url = `${BASE_URL}/rest/api/1.0/projects/${project}/permissions/groups`;
+    d = await this.bb.get(url);
+
+    if (d?.values) {
+      for (const g of d.values) {
+        if (await this.inGroup(g.group.name, user)) {
+          return { hasAccess: true, level: g.permission, source: 'PROJECT_GROUP' };
+        }
+      }
+    }
+
+    return { hasAccess: false };
+  }
+}
+
+/* ================= HTML ================= */
+
+function buildEvidenceHtml(r, res) {
+  return `
+<html><body>
+<table id="evidence" border="1" cellpadding="6">
+<tr><td>User</td><td>${r.user}</td></tr>
+<tr><td>Account ID</td><td>${r.accountId}</td></tr>
+<tr><td>Project</td><td>${r.project}</td></tr>
+<tr><td>Access</td><td>${res.hasAccess}</td></tr>
+<tr><td>Level</td><td>${res.level || '-'}</td></tr>
+<tr><td>Source</td><td>${res.source || '-'}</td></tr>
+<tr><td>Timestamp</td><td>${tsIST()}</td></tr>
+</table>
+</body></html>`;
+}
+
+/* ================= MAIN ================= */
+
+(async function main() {
+  logger.info('Audit started');
+
+  extractUniqueSSOFromExcel();
+  extractUserProjectCSV();
+
+  fs.writeFileSync(
+    ACCESS_OUTPUT_CSV,
+    'User,Account ID,Project,Status,Level,Source,Timestamp,Screenshot\n'
+  );
+  fs.writeFileSync(
+    NO_ACCESS_OUTPUT_CSV,
+    'User,Account ID,Project,Status,Level,Source,Timestamp,Screenshot\n'
+  );
+
+  const rows = fs.readFileSync(USER_PROJECT_CSV, 'utf8')
+    .split('\n')
+    .slice(1)
+    .filter(Boolean)
+    .map(l => {
+      const [u, a, p] = l.split(',');
+      return {
+        user: cleanCsvValue(u),
+        accountId: cleanCsvValue(a),
+        project: cleanCsvValue(p)
+      };
+    });
+
+  const bb = new BitbucketClient();
+  const resolver = new PermissionResolver(bb);
+
+  const browser = await puppeteer.launch({ headless: true });
+  const page = await browser.newPage();
+
+  for (const r of rows) {
+    const res = await resolver.checkProject(r.project, r.user);
+
+    const targetDir = res.hasAccess ? HAS_ACCESS_PNG_DIR : NO_ACCESS_PNG_DIR;
+    ensureDir(targetDir);
+
+    const png = path.join(
+      targetDir,
+      `${r.user}_${r.project}_${safeTsIST()}.png`
+    );
+
+    await page.setContent(buildEvidenceHtml(r, res));
+    const table = await page.$('#evidence');
+    await table.screenshot({ path: png, padding: 10 });
+
+    const line = [
+      r.user,
+      r.accountId,
+      r.project,
+      res.hasAccess ? 'HAS_ACCESS' : 'NO_ACCESS',
+      res.level || '',
+      res.source || '',
+      tsIST(),
+      png
+    ].join(',') + '\n';
+
+    fs.appendFileSync(
+      res.hasAccess ? ACCESS_OUTPUT_CSV : NO_ACCESS_OUTPUT_CSV,
+      line
+    );
+  }
+
+  await browser.close();
+  logger.info('Audit completed successfully');
+})();
