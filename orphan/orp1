@@ -1,0 +1,248 @@
+'use strict';
+
+/* ================= IMPORTS ================= */
+
+const fs = require('fs');
+const path = require('path');
+const xlsx = require('xlsx');
+const axios = require('axios');
+const puppeteer = require('puppeteer');
+const officegen = require('officegen');
+const winston = require('winston');
+require('dotenv').config();
+
+/* ================= CONFIG ================= */
+
+const INPUT_DIR = path.join(__dirname, 'input_files');
+const OUTPUT_DIR = path.join(__dirname, 'output_files');
+const LOG_DIR = path.join(OUTPUT_DIR, 'logs');
+const DOC_DIR = path.join(OUTPUT_DIR, 'doc');
+
+const INPUT_XLSX = path.join(
+  INPUT_DIR,
+  'Bitbucket_OrphanDecisions_Q32025.xlsx'
+);
+
+const UNIQUE_SSO_CSV = path.join(
+  OUTPUT_DIR,
+  'unique_sso_extracted.csv'
+);
+
+const PROJECT_CODE_CSV = path.join(
+  OUTPUT_DIR,
+  'user_sso_project_code_extracted.csv'
+);
+
+const HAS_ACCESS_PNG_DIR = path.join(OUTPUT_DIR, 'png/has_access');
+const NO_ACCESS_PNG_DIR = path.join(OUTPUT_DIR, 'png/no_access');
+
+const ACCESS_OUTPUT_CSV = path.join(
+  OUTPUT_DIR,
+  'access_check_results.csv'
+);
+const NO_ACCESS_OUTPUT_CSV = path.join(
+  OUTPUT_DIR,
+  'no_access_check_results.csv'
+);
+
+const BASE_URL = process.env.BB_URL?.replace(/\/+$/, '');
+const USERNAME = process.env.BB_USERNAME;
+const PASSWORD = process.env.BB_AUDIT_PWD;
+
+if (!BASE_URL || !USERNAME || !PASSWORD) {
+  console.error('❌ Missing Bitbucket credentials');
+  process.exit(1);
+}
+
+/* ================= UTILS ================= */
+
+const ensureDir = d => !fs.existsSync(d) && fs.mkdirSync(d, { recursive: true });
+const trim = v => String(v || '').trim();
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function tsIST() {
+  return new Intl.DateTimeFormat('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  }).format(new Date()).replace(',', '');
+}
+
+function safeTsIST() {
+  return tsIST().replace(/[^\d]/g, '-');
+}
+
+function extractProjectKey(entitlement) {
+  if (!entitlement) return '';
+  const right = entitlement.split(':')[1];
+  return right ? right.split('-')[0].trim() : '';
+}
+
+/* ================= DIRS ================= */
+
+[
+  OUTPUT_DIR,
+  LOG_DIR,
+  DOC_DIR,
+  HAS_ACCESS_PNG_DIR,
+  NO_ACCESS_PNG_DIR
+].forEach(ensureDir);
+
+/* ================= LOGGER ================= */
+
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.timestamp({ format: () => tsIST() }),
+  transports: [
+    new winston.transports.Console({
+      format: winston.format.printf(
+        ({ timestamp, level, message }) =>
+          `${timestamp} [${level}] ${message}`
+      )
+    }),
+    new winston.transports.File({
+      filename: path.join(LOG_DIR, 'audit-info.log')
+    }),
+    new winston.transports.File({
+      filename: path.join(LOG_DIR, 'audit-error.log'),
+      level: 'error'
+    })
+  ]
+});
+
+/* ================= BITBUCKET CLIENT ================= */
+
+class BitbucketClient {
+  constructor() {
+    this.queue = [];
+    this.active = 0;
+    this.MAX = 5;
+  }
+
+  async get(url) {
+    return new Promise(resolve => {
+      this.queue.push({ url, resolve });
+      this._next();
+    });
+  }
+
+  async _next() {
+    if (this.active >= this.MAX || !this.queue.length) return;
+    const job = this.queue.shift();
+    this.active++;
+
+    try {
+      const r = await axios.get(job.url, {
+        auth: { username: USERNAME, password: PASSWORD }
+      });
+      job.resolve(r.data);
+    } catch {
+      logger.error(`API error | ${job.url}`);
+      job.resolve(null);
+    } finally {
+      this.active--;
+      this._next();
+    }
+  }
+}
+
+/* ================= PERMISSION RESOLVER ================= */
+
+class PermissionResolver {
+  constructor(bb) {
+    this.bb = bb;
+    this.groupCache = new Map();
+  }
+
+  async inGroup(group, user) {
+    const key = `${group}:${user}`;
+    if (this.groupCache.has(key)) return this.groupCache.get(key);
+
+    const url =
+      `${BASE_URL}/rest/api/1.0/admin/groups/more-members` +
+      `?context=${encodeURIComponent(group)}` +
+      `&filter=${encodeURIComponent(user)}`;
+
+    const d = await this.bb.get(url);
+    const ok = d?.values?.length > 0;
+    this.groupCache.set(key, ok);
+    return ok;
+  }
+
+  best(perms) {
+    const p = { ADMIN: 3, WRITE: 2, READ: 1 };
+    return perms.sort((a, b) => p[b] - p[a])[0];
+  }
+
+  async checkProject(project, user) {
+    const apiEvidence = [];
+
+    let url =
+      `${BASE_URL}/rest/api/1.0/projects/${project}` +
+      `/permissions/users?filter=${user}`;
+
+    let d = await this.bb.get(url);
+
+    apiEvidence.push({
+      endpoint: url,
+      matched: !!d?.values?.length,
+      values: d?.values || []
+    });
+
+    if (d?.values?.length) {
+      return {
+        hasAccess: true,
+        level: this.best(d.values.map(v => v.permission)),
+        source: 'PROJECT_USER',
+        apiEvidence
+      };
+    }
+
+    url =
+      `${BASE_URL}/rest/api/1.0/projects/${project}/permissions/groups`;
+    d = await this.bb.get(url);
+
+    apiEvidence.push({
+      endpoint: url,
+      matched: false,
+      values: d?.values || []
+    });
+
+    if (d?.values) {
+      for (const g of d.values) {
+        if (await this.inGroup(g.group.name, user)) {
+          apiEvidence.at(-1).matched = true;
+          return {
+            hasAccess: true,
+            level: g.permission,
+            source: 'PROJECT_GROUP',
+            apiEvidence
+          };
+        }
+      }
+    }
+
+    return { hasAccess: false, apiEvidence };
+  }
+}
+
+/* ================= SCREENSHOT HTML ================= */
+
+function buildEvidenceHtml({
+  user, accountId, project,
+  hasAccess, level, source, apiEvidence
+}) {
+  return `
+<html>
+<body style="font-family:Arial;padding:20px">
+<h2>Bitbucket Access Evidence</h2>
+<table border="1" cellspacing="0" cellpadding="6">
+<tr><b>Username</b></td><td>${user}</td></tr>
+<tr><b>Account ID</b></td><td>${accountId}</td></tr>
+<tr><b>Project</b></td><td>${project}</td></tr>
+<tr><b>Timestamp</b></td><
