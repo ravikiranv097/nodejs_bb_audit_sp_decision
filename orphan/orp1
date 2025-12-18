@@ -133,6 +133,7 @@ class BitbucketClient {
 
   async _next() {
     if (this.active >= this.MAX || !this.queue.length) return;
+
     const job = this.queue.shift();
     this.active++;
 
@@ -239,10 +240,163 @@ function buildEvidenceHtml({
 }) {
   return `
 <html>
-<body style="font-family:Arial;padding:20px">
+<head>
+<style>
+body { font-family: Arial; padding: 20px; }
+table { border-collapse: collapse; }
+td { border: 1px solid #999; padding: 6px 10px; }
+.label { font-weight: bold; background: #f2f2f2; }
+.yes { color: green; font-weight: bold; }
+.no { color: red; font-weight: bold; }
+pre { white-space: pre-wrap; }
+</style>
+</head>
+<body>
 <h2>Bitbucket Access Evidence</h2>
-<table border="1" cellspacing="0" cellpadding="6">
-<tr><b>Username</b></td><td>${user}</td></tr>
-<tr><b>Account ID</b></td><td>${accountId}</td></tr>
-<tr><b>Project</b></td><td>${project}</td></tr>
-<tr><b>Timestamp</b></td><
+<table>
+<tr><td class="label">User SSO</td><td>${user}</td></tr>
+<tr><td class="label">Account ID</td><td>${accountId}</td></tr>
+<tr><td class="label">Project</td><td>${project}</td></tr>
+<tr><td class="label">Timestamp (IST)</td><td>${tsIST()}</td></tr>
+<tr><td class="label">Has Access</td>
+<td class="${hasAccess ? 'yes' : 'no'}">
+${hasAccess ? 'YES' : 'NO'}
+</td></tr>
+<tr><td class="label">Level</td><td>${level || '-'}</td></tr>
+<tr><td class="label">Source</td><td>${source || '-'}</td></tr>
+<tr><td class="label">API Evidence</td>
+<td><pre>${JSON.stringify(apiEvidence, null, 2)}</pre></td></tr>
+</table>
+</body>
+</html>`;
+}
+
+/* ================= DOCX ================= */
+
+async function generateDoc(imageDir, outputName) {
+  const images = fs.readdirSync(imageDir).filter(f => f.endsWith('.png'));
+  if (!images.length) return;
+
+  const docx = officegen('docx');
+  docx.createP().addText(outputName.replace('.docx', ''), { bold: true });
+
+  images.forEach((img, i) => {
+    docx.createP().addImage(path.join(imageDir, img));
+    if (i < images.length - 1)
+      docx.createP().addText('', { pageBreakBefore: true });
+  });
+
+  docx.generate(fs.createWriteStream(path.join(DOC_DIR, outputName)));
+}
+
+/* ================= MAIN ================= */
+
+(async function main() {
+  logger.info('Bitbucket audit started');
+
+  /* ---------- LOAD XLSX ---------- */
+
+  const wb = xlsx.readFile(INPUT_XLSX);
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const rows = xlsx.utils.sheet_to_json(ws, { defval: '' });
+
+  /* ---------- UNIQUE USER SSO ---------- */
+
+  const uniqueMap = new Map();
+  rows.forEach(r => {
+    const user = trim(r['User SSO']);
+    if (user && !uniqueMap.has(user)) {
+      uniqueMap.set(user, r);
+    }
+  });
+
+  const uniqueRows = [...uniqueMap.values()];
+  logger.info(`Unique users found: ${uniqueRows.length}`);
+
+  /* ---------- CSV: unique_sso_extracted.csv ---------- */
+
+  fs.writeFileSync(
+    UNIQUE_SSO_CSV,
+    'User SSO,Account ID,Entitlement Description\n'
+  );
+
+  uniqueRows.forEach(r => {
+    fs.appendFileSync(
+      UNIQUE_SSO_CSV,
+      `${trim(r['User SSO'])},${trim(r['Account ID'])},"${trim(r['Entitlement Description'])}"\n`
+    );
+  });
+
+  /* ---------- CSV: user_sso_project_code_extracted.csv ---------- */
+
+  fs.writeFileSync(
+    PROJECT_CODE_CSV,
+    'User SSO,Account ID,Project Code\n'
+  );
+
+  uniqueRows.forEach(r => {
+    fs.appendFileSync(
+      PROJECT_CODE_CSV,
+      `${trim(r['User SSO'])},${trim(r['Account ID'])},${extractProjectKey(r['Entitlement Description'])}\n`
+    );
+  });
+
+  /* ---------- ACCESS CHECK ---------- */
+
+  fs.writeFileSync(
+    ACCESS_OUTPUT_CSV,
+    'User SSO,Account ID,Project,Access,Level,Source,Timestamp,Screenshot\n'
+  );
+  fs.writeFileSync(
+    NO_ACCESS_OUTPUT_CSV,
+    'User SSO,Account ID,Project,Access,Level,Source,Timestamp,Screenshot\n'
+  );
+
+  const bb = new BitbucketClient();
+  const resolver = new PermissionResolver(bb);
+
+  const browser = await puppeteer.launch({ headless: true });
+  const page = await browser.newPage();
+
+  for (const r of uniqueRows) {
+    const user = trim(r['User SSO']);
+    const accountId = trim(r['Account ID']);
+    const project = extractProjectKey(r['Entitlement Description']);
+    if (!project) continue;
+
+    logger.info(`Checking user=${user}, project=${project}`);
+
+    const res = await resolver.checkProject(project, user);
+
+    const pngPath = path.join(
+      res.hasAccess ? HAS_ACCESS_PNG_DIR : NO_ACCESS_PNG_DIR,
+      `${user}_${project}_${safeTsIST()}.png`
+    );
+
+    await page.setContent(
+      buildEvidenceHtml({ user, accountId, project, ...res }),
+      { waitUntil: 'domcontentloaded' }
+    );
+
+    await sleep(80);
+    await page.screenshot({ path: pngPath });
+
+    const line =
+      `${user},${accountId},${project},` +
+      `${res.hasAccess ? 'HAS_ACCESS' : 'NO_ACCESS'},` +
+      `${res.level || ''},${res.source || ''},` +
+      `${tsIST()},${pngPath}\n`;
+
+    fs.appendFileSync(
+      res.hasAccess ? ACCESS_OUTPUT_CSV : NO_ACCESS_OUTPUT_CSV,
+      line
+    );
+  }
+
+  await browser.close();
+
+  await generateDoc(HAS_ACCESS_PNG_DIR, 'Bitbucket_Has_Access_Report.docx');
+  await generateDoc(NO_ACCESS_PNG_DIR, 'Bitbucket_No_Access_Report.docx');
+
+  logger.info('Bitbucket audit completed successfully');
+})();
