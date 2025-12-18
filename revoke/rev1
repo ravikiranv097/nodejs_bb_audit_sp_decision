@@ -1,0 +1,224 @@
+'use strict';
+
+/* ================= IMPORTS ================= */
+
+const fs = require('fs');
+const path = require('path');
+const xlsx = require('xlsx');
+const axios = require('axios');
+const puppeteer = require('puppeteer');
+const officegen = require('officegen');
+const winston = require('winston');
+require('dotenv').config();
+
+/* ================= CONFIG ================= */
+
+const INPUT_DIR = path.join(__dirname, 'input_files');
+const OUTPUT_DIR = path.join(__dirname, 'output_files');
+const LOG_DIR = path.join(OUTPUT_DIR, 'logs');
+const DOC_DIR = path.join(OUTPUT_DIR, 'doc');
+
+const INPUT_XLSX = path.join(INPUT_DIR, 'Bitbucket_OrphanDecisions_Q32025.xlsx');
+
+const HAS_ACCESS_PNG_DIR = path.join(OUTPUT_DIR, 'png/has_access');
+const NO_ACCESS_PNG_DIR = path.join(OUTPUT_DIR, 'png/no_access');
+
+const ACCESS_OUTPUT_CSV = path.join(OUTPUT_DIR, 'access_check_results.csv');
+const NO_ACCESS_OUTPUT_CSV = path.join(OUTPUT_DIR, 'no_access_check_results.csv');
+
+const BASE_URL = process.env.BB_URL?.replace(/\/+$/, '');
+const USERNAME = process.env.BB_USERNAME;
+const PASSWORD = process.env.BB_AUDIT_PWD;
+
+if (!BASE_URL || !USERNAME || !PASSWORD) {
+  console.error('❌ Missing Bitbucket credentials');
+  process.exit(1);
+}
+
+/* ================= UTILS ================= */
+
+const ensureDir = d => !fs.existsSync(d) && fs.mkdirSync(d, { recursive: true });
+const trim = v => String(v || '').trim();
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function tsIST() {
+  return new Intl.DateTimeFormat('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    dateStyle: 'short',
+    timeStyle: 'medium',
+    hour12: false
+  }).format(new Date());
+}
+
+function safeTsIST() {
+  return tsIST().replace(/[^\d]/g, '-');
+}
+
+/* ================= DIRS ================= */
+
+[
+  OUTPUT_DIR,
+  LOG_DIR,
+  DOC_DIR,
+  HAS_ACCESS_PNG_DIR,
+  NO_ACCESS_PNG_DIR
+].forEach(ensureDir);
+
+/* ================= LOGGER ================= */
+
+const logger = winston.createLogger({
+  transports: [
+    new winston.transports.Console(),
+    new winston.transports.File({ filename: path.join(LOG_DIR, 'audit.log') })
+  ]
+});
+
+/* ================= BITBUCKET CLIENT ================= */
+
+class BitbucketClient {
+  async req(method, url) {
+    try {
+      const r = await axios({
+        method,
+        url,
+        auth: { username: USERNAME, password: PASSWORD }
+      });
+      return r.data;
+    } catch (e) {
+      logger.error(`API ${method} failed: ${url}`);
+      return null;
+    }
+  }
+}
+
+/* ================= PERMISSION RESOLVER ================= */
+
+class PermissionResolver {
+  constructor(bb) {
+    this.bb = bb;
+  }
+
+  async checkProject(project, user) {
+    const url = `${BASE_URL}/rest/api/1.0/projects/${project}/permissions/users?filter=${user}`;
+    const d = await this.bb.req('get', url);
+    if (d?.values?.length) {
+      return { hasAccess: true, level: 'PROJECT', source: 'PROJECT_USER' };
+    }
+    return { hasAccess: false };
+  }
+
+  async checkProjectGroup(project, user) {
+    const url = `${BASE_URL}/rest/api/1.0/projects/${project}/permissions/groups`;
+    const d = await this.bb.req('get', url);
+    if (!d?.values) return { hasAccess: false };
+
+    for (const g of d.values) {
+      const u = await this.bb.req(
+        'get',
+        `${BASE_URL}/rest/api/1.0/admin/groups/more-members?context=${g.group.name}&filter=${user}`
+      );
+      if (u?.values?.length) {
+        return { hasAccess: true, level: 'PROJECT', source: 'PROJECT_GROUP', group: g.group.name };
+      }
+    }
+    return { hasAccess: false };
+  }
+
+  async checkRepo(project, user) {
+    const repos = await this.bb.req('get', `${BASE_URL}/rest/api/1.0/projects/${project}/repos?limit=100`);
+    if (!repos?.values) return { hasAccess: false };
+
+    for (const r of repos.values) {
+      const u = await this.bb.req(
+        'get',
+        `${BASE_URL}/rest/api/1.0/projects/${project}/repos/${r.slug}/permissions/users?filter=${user}`
+      );
+      if (u?.values?.length) {
+        return {
+          hasAccess: true,
+          level: 'REPO',
+          source: 'REPO_USER',
+          repo: r.slug
+        };
+      }
+    }
+    return { hasAccess: false };
+  }
+}
+
+/* ================= REVOKER ================= */
+
+async function revoke(bb, res, project, user) {
+  if (res.source === 'PROJECT_USER') {
+    await bb.req(
+      'delete',
+      `${BASE_URL}/rest/api/1.0/projects/${project}/permissions/users?name=${user}`
+    );
+  }
+
+  if (res.source === 'PROJECT_GROUP') {
+    await bb.req(
+      'delete',
+      `${BASE_URL}/rest/api/1.0/projects/${project}/permissions/groups?name=${res.group}`
+    );
+  }
+
+  if (res.source === 'REPO_USER') {
+    await bb.req(
+      'delete',
+      `${BASE_URL}/rest/api/1.0/projects/${project}/repos/${res.repo}/permissions/users?name=${user}`
+    );
+  }
+}
+
+/* ================= MAIN ================= */
+
+(async () => {
+  const wb = xlsx.readFile(INPUT_XLSX);
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const rows = xlsx.utils.sheet_to_json(ws, { defval: '' });
+
+  const bb = new BitbucketClient();
+  const resolver = new PermissionResolver(bb);
+
+  const browser = await puppeteer.launch({ headless: true });
+  const page = await browser.newPage();
+
+  fs.writeFileSync(
+    ACCESS_OUTPUT_CSV,
+    'User,Project,Access,Level,Source,Timestamp,Screenshot\n'
+  );
+
+  for (const r of rows) {
+    const user = trim(r['User SSO']);
+    const project = trim(r['Project Code']);
+    if (!user || !project) continue;
+
+    let res =
+      (await resolver.checkProject(project, user)) ||
+      (await resolver.checkProjectGroup(project, user)) ||
+      (await resolver.checkRepo(project, user));
+
+    if (res?.hasAccess) {
+      await revoke(bb, res, project, user);
+      await sleep(500);
+      res = await resolver.checkProject(project, user);
+    }
+
+    const png = path.join(
+      res?.hasAccess ? HAS_ACCESS_PNG_DIR : NO_ACCESS_PNG_DIR,
+      `${user}_${project}_${safeTsIST()}.png`
+    );
+
+    await page.setContent(`<h3>${user} | ${project}</h3><pre>${JSON.stringify(res, null, 2)}</pre>`);
+    await page.screenshot({ path: png });
+
+    fs.appendFileSync(
+      ACCESS_OUTPUT_CSV,
+      `${user},${project},${res?.hasAccess ? 'YES' : 'NO'},${res?.level || ''},${res?.source || ''},${tsIST()},${png}\n`
+    );
+  }
+
+  await browser.close();
+  logger.info('Audit & revoke completed');
+})();
