@@ -1,0 +1,11 @@
+function extractProjectKey(entitlement) {
+  if (!entitlement) return '';
+
+  const normalized = String(entitlement)
+    .replace(/\u00A0/g, ' ')     // non-breaking space
+    .replace(/[–—]/g, '-')      // en/em dash → hyphen
+    .trim();
+
+  const match = normalized.match(/[:\s]\s*([A-Za-z0-9]+)\s*-\s*/);
+  return match ? match[1].toUpperCase() : '';
+}
