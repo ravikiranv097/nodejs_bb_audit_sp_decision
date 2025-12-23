@@ -115,18 +115,6 @@ class BitbucketClient {
     });
   }
 
-  async delete(url) {
-    try {
-      await axios.delete(url, {
-        auth: { username: USERNAME, password: PASSWORD }
-      });
-      return true;
-    } catch {
-      logger.error(`DELETE failed | ${url}`);
-      return false;
-    }
-  }
-
   async _next() {
     if (this.active >= this.MAX || !this.queue.length) return;
     const job = this.queue.shift();
@@ -153,6 +141,7 @@ class PermissionResolver {
   constructor(bb) {
     this.bb = bb;
     this.groupCache = new Map();
+    this.repoCache = new Map();
   }
 
   async inGroup(group, user) {
@@ -160,10 +149,7 @@ class PermissionResolver {
     if (this.groupCache.has(key)) return this.groupCache.get(key);
 
     const url =
-      `${BASE_URL}/rest/api/1.0/admin/groups/more-members` +
-      `?context=${encodeURIComponent(group)}` +
-      `&filter=${encodeURIComponent(user)}`;
-
+      `${BASE_URL}/rest/api/1.0/admin/groups/more-members?context=${encodeURIComponent(group)}&filter=${encodeURIComponent(user)}`;
     const d = await this.bb.get(url);
     const ok = d?.values?.length > 0;
     this.groupCache.set(key, ok);
@@ -175,14 +161,27 @@ class PermissionResolver {
     return perms.sort((a, b) => p[b] - p[a])[0];
   }
 
+  async getRepos(project) {
+    if (this.repoCache.has(project)) return this.repoCache.get(project);
+
+    const url =
+      `${BASE_URL}/rest/api/1.0/projects/${project}/repos?limit=1000`;
+    const d = await this.bb.get(url);
+    const repos = d?.values || [];
+    this.repoCache.set(project, repos);
+    return repos;
+  }
+
   async checkProject(project, user) {
     const apiEvidence = [];
 
-    /* 1️⃣ Project user access */
+    // logger.info(`→ Project user permission check`);
+
     let url =
       `${BASE_URL}/rest/api/1.0/projects/${project}/permissions/users?filter=${user}`;
     let d = await this.bb.get(url);
-    apiEvidence.push({ endpoint: url, values: d?.values || [] });
+
+    apiEvidence.push({ endpoint: url, matched: !!d?.values?.length, values: d?.values || [] });
 
     if (d?.values?.length) {
       return {
@@ -193,37 +192,17 @@ class PermissionResolver {
       };
     }
 
-    /* 2️⃣ Repo user access */
-    url =
-      `${BASE_URL}/rest/api/1.0/projects/${project}/repos?limit=1000`;
-    const repos = await this.bb.get(url);
+    // logger.info(`→ Project group permission check`);
 
-    for (const r of repos?.values || []) {
-      const repo = r.slug;
-      const ru =
-        `${BASE_URL}/rest/api/1.0/projects/${project}/repos/${repo}/permissions/users?filter=${user}`;
-      const rd = await this.bb.get(ru);
-      apiEvidence.push({ endpoint: ru, values: rd?.values || [] });
-
-      if (rd?.values?.length) {
-        return {
-          hasAccess: true,
-          level: this.best(rd.values.map(v => v.permission)),
-          source: 'REPO_USER',
-          repo,
-          apiEvidence
-        };
-      }
-    }
-
-    /* 3️⃣ Project group access */
     url =
       `${BASE_URL}/rest/api/1.0/projects/${project}/permissions/groups`;
     d = await this.bb.get(url);
-    apiEvidence.push({ endpoint: url, values: d?.values || [] });
+
+    apiEvidence.push({ endpoint: url, matched: false, values: d?.values || [] });
 
     for (const g of d?.values || []) {
       if (await this.inGroup(g.group.name, user)) {
+        apiEvidence[apiEvidence.length - 1].matched = true;
         return {
           hasAccess: true,
           level: g.permission,
@@ -233,21 +212,41 @@ class PermissionResolver {
       }
     }
 
-    /* 4️⃣ Repo group access */
-    for (const r of repos?.values || []) {
-      const repo = r.slug;
+    // logger.info(`→ Repo-level permission checks`);
+
+    const repos = await this.getRepos(project);
+
+    for (const r of repos) {
+      const ru =
+        `${BASE_URL}/rest/api/1.0/projects/${project}/repos/${r.slug}/permissions/users?filter=${user}`;
+      const rd = await this.bb.get(ru);
+
+      apiEvidence.push({ endpoint: ru, matched: !!rd?.values?.length, values: rd?.values || [] });
+
+      if (rd?.values?.length) {
+        return {
+          hasAccess: true,
+          level: this.best(rd.values.map(v => v.permission)),
+          source: `REPO_USER:${r.slug}`,
+          apiEvidence
+        };
+      }
+    }
+
+    for (const r of repos) {
       const rg =
-        `${BASE_URL}/rest/api/1.0/projects/${project}/repos/${repo}/permissions/groups`;
+        `${BASE_URL}/rest/api/1.0/projects/${project}/repos/${r.slug}/permissions/groups`;
       const gd = await this.bb.get(rg);
-      apiEvidence.push({ endpoint: rg, values: gd?.values || [] });
+
+      apiEvidence.push({ endpoint: rg, matched: false, values: gd?.values || [] });
 
       for (const g of gd?.values || []) {
         if (await this.inGroup(g.group.name, user)) {
+          apiEvidence[apiEvidence.length - 1].matched = true;
           return {
             hasAccess: true,
             level: g.permission,
-            source: 'REPO_GROUP',
-            repo,
+            source: `REPO_GROUP:${r.slug}`,
             apiEvidence
           };
         }
@@ -258,23 +257,7 @@ class PermissionResolver {
   }
 }
 
-/* ================= REVOKE ================= */
-
-async function revokeAccess(bb, res, project, user) {
-  if (res.source === 'PROJECT_USER') {
-    const url =
-      `${BASE_URL}/rest/api/1.0/projects/${project}/permissions/users?name=${user}`;
-    await bb.delete(url);
-  }
-
-  if (res.source === 'REPO_USER') {
-    const url =
-      `${BASE_URL}/rest/api/1.0/projects/${project}/repos/${res.repo}/permissions/users?name=${user}`;
-    await bb.delete(url);
-  }
-}
-
-/* ================= HTML ================= */
+/* ================= SCREENSHOT HTML ================= */
 
 function buildEvidenceHtml({
   user, accountId, project, active,
@@ -283,26 +266,24 @@ function buildEvidenceHtml({
   return `
 <html>
 <body>
-<h3>Bitbucket Access Evidence</h3>
-<table border="1" cellpadding="6" cellspacing="0" id="evidence-table">
-<tr><th>User</th><td>${user}</td></tr>
-<tr><th>Account ID</th><td>${accountId}</td></tr>
-<tr><th>Project</th><td>${project}</td></tr>
-<tr><th>Active</th><td>${active}</td></tr>
-<tr><th>Has Access</th><td>${hasAccess ? 'YES' : 'NO'}</td></tr>
-<tr><th>Level</th><td>${level || '-'}</td></tr>
-<tr><th>Source</th><td>${source || '-'}</td></tr>
-<tr><th>Timestamp</th><td>${tsIST()}</td></tr>
-<tr>
-<th>API Evidence</th>
-<td><pre>${JSON.stringify(apiEvidence, null, 2)}</pre></td>
-</tr>
+<h2>Bitbucket Access Evidence</h2>
+<table id="evidence-table" border="1" cellpadding="6" cellspacing="0">
+<tr><td><b>User</b></td><td>${user}</td></tr>
+<tr><td><b>Account ID</b></td><td>${accountId}</td></tr>
+<tr><td><b>Project</b></td><td>${project}</td></tr>
+<tr><td><b>Active</b></td><td>${active}</td></tr>
+<tr><td><b>Has Access</b></td><td>${hasAccess}</td></tr>
+<tr><td><b>Level</b></td><td>${level || '-'}</td></tr>
+<tr><td><b>Source</b></td><td>${source || '-'}</td></tr>
+<tr><td><b>Timestamp</b></td><td>${tsIST()}</td></tr>
+<tr><td><b>API Evidence</b></td>
+<td><pre>${JSON.stringify(apiEvidence, null, 2)}</pre></td></tr>
 </table>
 </body>
 </html>`;
 }
 
-/* ================= DOC ================= */
+/* ================= DOCX ================= */
 
 async function generateDoc(imageDir, outputName) {
   const images = fs.readdirSync(imageDir).filter(f => f.endsWith('.png'));
@@ -327,11 +308,11 @@ async function generateDoc(imageDir, outputName) {
 
   fs.writeFileSync(
     ACCESS_OUTPUT_CSV,
-    'Username,Account ID,Project,Access Status,Level,Source,Timestamp,PNG\n'
+    'Username,Account ID,Project,Access Status,Level,Source,Timestamp (IST),Screenshot\n'
   );
   fs.writeFileSync(
     NO_ACCESS_OUTPUT_CSV,
-    'Username,Account ID,Project,Access Status,Level,Source,Timestamp,PNG\n'
+    'Username,Account ID,Project,Access Status,Level,Source,Timestamp (IST),Screenshot\n'
   );
 
   const bb = new BitbucketClient();
@@ -342,8 +323,11 @@ async function generateDoc(imageDir, outputName) {
   const rows = xlsx.utils.sheet_to_json(ws, { defval: '' })
     .filter(r => trim(r.Decision) === 'Revoked');
 
+  logger.info(`Loaded ${rows.length} revoked rows`);
+
   const browser = await puppeteer.launch({ headless: true });
   const page = await browser.newPage();
+  page.setDefaultNavigationTimeout(0);
 
   for (const r of rows) {
     const user = trim(r['User SSO']);
@@ -351,12 +335,9 @@ async function generateDoc(imageDir, outputName) {
     const active = trim(r['Active'] || 'N/A');
     const project = extractProjectKey(r['Entitlement Description']);
 
-    let res = await resolver.checkProject(project, user);
+    logger.info(`Checking | user=${user} | project=${project}`);
 
-    if (res.hasAccess && ['PROJECT_USER', 'REPO_USER'].includes(res.source)) {
-      await revokeAccess(bb, res, project, user);
-      res = await resolver.checkProject(project, user);
-    }
+    const res = await resolver.checkProject(project, user);
 
     const pngPath = path.join(
       res.hasAccess ? HAS_ACCESS_PNG_DIR : NO_ACCESS_PNG_DIR,
@@ -364,7 +345,10 @@ async function generateDoc(imageDir, outputName) {
     );
 
     const html = buildEvidenceHtml({
-      user, accountId, project, active,
+      user,
+      accountId,
+      project,
+      active,
       hasAccess: res.hasAccess,
       level: res.level,
       source: res.source,
@@ -372,7 +356,10 @@ async function generateDoc(imageDir, outputName) {
     });
 
     await page.setContent(html, { waitUntil: 'domcontentloaded' });
-    await (await page.$('#evidence-table')).screenshot({ path: pngPath });
+    await sleep(50);
+
+    const table = await page.$('#evidence-table');
+    await table.screenshot({ path: pngPath, padding: 15 });
 
     fs.appendFileSync(
       res.hasAccess ? ACCESS_OUTPUT_CSV : NO_ACCESS_OUTPUT_CSV,
