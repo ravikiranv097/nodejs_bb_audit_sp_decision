@@ -1,0 +1,290 @@
+const fs = require("fs");
+const path = require("path");
+const xlsx = require("xlsx");
+
+const ROOT = path.join(__dirname, "..");
+const INPUT_ROOT = path.join(ROOT, "input_files");
+const OUTPUT_ROOT = path.join(ROOT, "output_files");
+
+/* ===================== COMMON HELPERS ===================== */
+
+function findSingleFile(dirPath, ext) {
+  if (!fs.existsSync(dirPath)) {
+    throw new Error(`Directory not found: ${dirPath}`);
+  }
+
+  const files = fs
+    .readdirSync(dirPath)
+    .filter(f => f.toLowerCase().endsWith(ext));
+
+  if (files.length === 0) {
+    throw new Error(`No ${ext} file found in ${dirPath}`);
+  }
+
+  if (files.length > 1) {
+    console.warn(`Multiple ${ext} files found in ${dirPath}, using ${files[0]}`);
+  }
+
+  return path.join(dirPath, files[0]);
+}
+
+/* ===================== CSV HELPERS ===================== */
+
+function readCsvRows(filePath) {
+  const content = fs.readFileSync(filePath, "utf8");
+
+  return content
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map(line =>
+      line
+        .split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/)
+        .map(v => v.replace(/^"|"$/g, "").trim())
+    );
+}
+
+/* ===================== XLSX HELPERS ===================== */
+
+function readXlsxRows(filePath) {
+  const wb = xlsx.readFile(filePath);
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  return xlsx.utils.sheet_to_json(ws, { header: 1, raw: false });
+}
+
+function writeXlsx(filePath, rows) {
+  const wb = xlsx.utils.book_new();
+  const ws = xlsx.utils.aoa_to_sheet(rows);
+  xlsx.utils.book_append_sheet(wb, ws, "Final_Userlist");
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  xlsx.writeFile(wb, filePath);
+}
+
+/* ===================== TEMPLATE & MAPPING ===================== */
+
+function loadTemplateHeader(templatePath) {
+  const rows = readXlsxRows(templatePath);
+  if (!rows.length) throw new Error("Template XLSX is empty");
+  return rows[0].map(c => String(c ?? ""));
+}
+
+function loadMapping(mappingPath) {
+  const rows = readXlsxRows(mappingPath);
+  const map = new Map();
+
+  for (let i = 1; i < rows.length; i++) {
+    const key = String(rows[i][0] ?? "").trim();
+    const val = String(rows[i][1] ?? "").trim();
+    if (key) map.set(key, val || key);
+  }
+
+  return map;
+}
+
+/* ===================== ENTITLEMENT ===================== */
+
+function deriveEntitlementMeta(permissionRaw) {
+  const p = (permissionRaw || "").toLowerCase();
+
+  if (p.includes("system") && p.includes("admin"))
+    return { letter: "P", hpa: "Yes" };
+
+  if (p.includes("admin") || p.includes("write") || p.includes("create"))
+    return { letter: "U", hpa: "No" };
+
+  return { letter: "V", hpa: "No" };
+}
+
+function mapTemplateRow(header, ctx) {
+  return header.map(col => {
+    const c = col.toLowerCase();
+    if (c.includes("user sso")) return ctx.userSso;
+    if (c.includes("account id")) return ctx.accountId;
+    if (c.includes("entitlement")) return ctx.entitlement;
+    if (c.includes("account type")) return ctx.accountType;
+    if (c.includes("hpa")) return ctx.hpa;
+    if (c.includes("user name")) return ctx.userName;
+    return "";
+  });
+}
+
+/* ===================== GLOBAL USERS (CSV) ===================== */
+
+function formatGlobalUsers({ templateHeader, mapping }) {
+  const filePath = findSingleFile(
+    path.join(INPUT_ROOT, "global_users"),
+    ".csv"
+  );
+
+  const rows = readCsvRows(filePath);
+  const out = [];
+
+  for (const row of rows) {
+    const rawSso = row[0] || "";
+    const userName = row[1] || "";
+    const permission = row[2] || "";
+
+    if (!rawSso) continue;
+
+    const isPersonal = /^[0-9]+$/.test(rawSso);
+    const userSso = isPersonal ? rawSso : mapping.get(rawSso) || rawSso;
+    const { letter, hpa } = deriveEntitlementMeta(permission);
+
+    out.push(
+      mapTemplateRow(templateHeader, {
+        userSso,
+        accountId: rawSso,
+        entitlement: `${letter} : ${permission}`,
+        accountType: isPersonal ? "Personal" : "NPA",
+        hpa,
+        userName
+      })
+    );
+  }
+
+  return out;
+}
+
+/* ===================== PROJECT USERS (CSV) ===================== */
+
+function formatProjectUsers({ templateHeader, mapping }) {
+  const filePath = findSingleFile(
+    path.join(INPUT_ROOT, "project_users"),
+    ".csv"
+  );
+
+  const rows = readCsvRows(filePath);
+  if (rows.length < 2) return [];
+
+  const header = rows[0].map(h => h.toLowerCase());
+  const idx = {
+    project: header.findIndex(h => h.includes("project")),
+    sso: header.findIndex(h => h.includes("user")),
+    perm: header.findIndex(h => h.includes("permission"))
+  };
+
+  const out = [];
+
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i];
+    const rawSso = row[idx.sso] || "";
+    if (!rawSso) continue;
+
+    const permission = row[idx.perm] || "";
+    const project = row[idx.project] || "";
+
+    const isPersonal = /^[0-9]+$/.test(rawSso);
+    const userSso = isPersonal ? rawSso : mapping.get(rawSso) || rawSso;
+    const { letter, hpa } = deriveEntitlementMeta(permission);
+
+    out.push(
+      mapTemplateRow(templateHeader, {
+        userSso,
+        accountId: rawSso,
+        entitlement: `${letter} : ${project}-${permission}`,
+        accountType: isPersonal ? "Personal" : "NPA",
+        hpa,
+        userName: rawSso
+      })
+    );
+  }
+
+  return out;
+}
+
+/* ===================== REPO USERS (CSV) ===================== */
+
+function formatRepoUsers({ templateHeader, mapping }) {
+  const filePath = findSingleFile(
+    path.join(INPUT_ROOT, "repo_users"),
+    ".csv"
+  );
+
+  const rows = readCsvRows(filePath);
+  if (rows.length < 2) return [];
+
+  const header = rows[0].map(h => h.toLowerCase());
+  const idx = {
+    project: header.findIndex(h => h.includes("project")),
+    repo: header.findIndex(h => h.includes("repo")),
+    sso: header.findIndex(h => h.includes("user")),
+    perm: header.findIndex(h => h.includes("permission"))
+  };
+
+  const out = [];
+
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i];
+    const rawSso = row[idx.sso] || "";
+    if (!rawSso) continue;
+
+    const project = row[idx.project] || "";
+    const repo = row[idx.repo] || "";
+    const permission = row[idx.perm] || "";
+
+    const isPersonal = /^[0-9]+$/.test(rawSso);
+    const userSso = isPersonal ? rawSso : mapping.get(rawSso) || rawSso;
+    const { letter, hpa } = deriveEntitlementMeta(permission);
+
+    out.push(
+      mapTemplateRow(templateHeader, {
+        userSso,
+        accountId: rawSso,
+        entitlement: `${letter} : ${project}-${repo}-${permission}`,
+        accountType: isPersonal ? "Personal" : "NPA",
+        hpa,
+        userName: rawSso
+      })
+    );
+  }
+
+  return out;
+}
+
+/* ===================== CSV OUTPUT ===================== */
+
+function writeCsv(filePath, header, rows) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const lines = [
+    header.map(h => `" ${h} "`).join(","),
+    ...rows.map(r => r.map(v => `" ${v} "`).join(","))
+  ];
+  fs.writeFileSync(filePath, lines.join("\n"));
+}
+
+/* ===================== MAIN ===================== */
+
+function main() {
+  const templatePath = findSingleFile(
+    path.join(INPUT_ROOT, "final_userlist_template"),
+    ".xlsx"
+  );
+  const mappingPath = findSingleFile(
+    path.join(INPUT_ROOT, "npa_npi_mapping"),
+    ".xlsx"
+  );
+
+  const templateHeader = loadTemplateHeader(templatePath);
+  const mapping = loadMapping(mappingPath);
+
+  const rows = [
+    ...formatGlobalUsers({ templateHeader, mapping }),
+    ...formatProjectUsers({ templateHeader, mapping }),
+    ...formatRepoUsers({ templateHeader, mapping })
+  ];
+
+  const outDir = path.join(OUTPUT_ROOT, "consolidated_final_userlist");
+  writeCsv(path.join(outDir, "Final_Userlist.csv"), templateHeader, rows);
+  writeXlsx(path.join(outDir, "Final_Userlist.xlsx"), [
+    templateHeader,
+    ...rows
+  ]);
+
+  console.log(`Generated ${rows.length} consolidated rows`);
+}
+
+try {
+  main();
+} catch (err) {
+  console.error("ERROR:", err.message);
+  process.exit(1);
+}
