@@ -1,0 +1,334 @@
+'use strict';
+
+/*
+===========================================================
+ BITBUCKET ACCESS AUDIT – FINAL REFERENCE-ALIGNED VERSION
+ - Evidence shape: { endpoint, matched, values }
+ - Project + Repo checks
+ - Revoke ONLY direct USER access
+ - NEVER revoke GROUP access
+===========================================================
+*/
+
+const fs = require('fs');
+const path = require('path');
+const axios = require('axios');
+const puppeteer = require('puppeteer');
+const officegen = require('officegen');
+require('dotenv').config();
+
+/* ================= CONFIG ================= */
+
+const INPUT_CSV = path.join(__dirname, 'input_files', 'access_check_results.csv');
+
+const OUTPUT_DIR = path.join(__dirname, 'output_files');
+const HTML_HAS = path.join(OUTPUT_DIR, 'html/has_access');
+const HTML_NO  = path.join(OUTPUT_DIR, 'html/no_access');
+const PNG_HAS  = path.join(OUTPUT_DIR, 'png/has_access');
+const PNG_NO   = path.join(OUTPUT_DIR, 'png/no_access');
+
+const DOC_DIR  = path.join(OUTPUT_DIR, 'doc');
+const HAS_DOCX = path.join(DOC_DIR, 'Bitbucket_Has_Access_Report.docx');
+const NO_DOCX  = path.join(DOC_DIR, 'Bitbucket_No_Access_Report.docx');
+
+const REVOKED_CSV = path.join(OUTPUT_DIR, 'revoked_access_results.csv');
+const GROUP_CSV   = path.join(OUTPUT_DIR, 'group_access_users.csv');
+
+const BASE_URL = process.env.BB_URL?.replace(/\/+$/, '');
+const AUTH = {
+  username: process.env.BB_USERNAME,
+  password: process.env.BB_AUDIT_PWD
+};
+
+if (!BASE_URL || !AUTH.username || !AUTH.password) {
+  console.error('❌ Missing Bitbucket credentials');
+  process.exit(1);
+}
+
+/* ================= UTILS ================= */
+
+const ensureDir = d => !fs.existsSync(d) && fs.mkdirSync(d, { recursive: true });
+const trim = v => String(v || '').trim();
+
+const tsIST = () =>
+  new Intl.DateTimeFormat('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  }).format(new Date()).replace(',', '');
+
+const safeTs = () => tsIST().replace(/[^\d]/g, '-');
+
+[OUTPUT_DIR, HTML_HAS, HTML_NO, PNG_HAS, PNG_NO, DOC_DIR].forEach(ensureDir);
+
+/* ================= API ================= */
+
+async function api(url, method = 'get') {
+  try {
+    const r = await axios({ url, method, auth: AUTH });
+    return r.data || { values: [] };
+  } catch {
+    return { values: [] };
+  }
+}
+
+/* ================= GROUP CHECK ================= */
+
+async function isUserInGroup(group, user) {
+  const url =
+    `${BASE_URL}/rest/api/1.0/admin/groups/more-members` +
+    `?context=${encodeURIComponent(group)}&filter=${encodeURIComponent(user)}`;
+  const d = await api(url);
+  return d.values.length > 0;
+}
+
+/* ================= ACCESS RESOLUTION ================= */
+
+async function resolveAccess(project, user) {
+  const evidence = [];
+  let decision = { hasAccess: false, level: '-', source: '-', category: 'NONE' };
+
+  // 1️⃣ Project USER
+  let url =
+    `${BASE_URL}/rest/api/1.0/projects/${project}/permissions/users?filter=${user}`;
+  let d = await api(url);
+
+  const puMatches = d.values.filter(v => v.user?.name === user);
+  evidence.push({
+    endpoint: url,
+    matched: puMatches.length > 0,
+    values: puMatches
+  });
+
+  if (puMatches.length) {
+    decision = {
+      hasAccess: true,
+      level: puMatches[0].permission,
+      source: 'PROJECT_USER',
+      category: 'USER'
+    };
+  }
+
+  // 2️⃣ Project GROUP
+  url =
+    `${BASE_URL}/rest/api/1.0/projects/${project}/permissions/groups`;
+  d = await api(url);
+
+  const pgMatches = [];
+  for (const g of d.values) {
+    if (await isUserInGroup(g.group.name, user)) {
+      pgMatches.push(g);
+    }
+  }
+
+  evidence.push({
+    endpoint: url,
+    matched: pgMatches.length > 0,
+    values: pgMatches
+  });
+
+  if (!decision.hasAccess && pgMatches.length) {
+    decision = {
+      hasAccess: true,
+      level: pgMatches[0].permission,
+      source: 'PROJECT_GROUP',
+      category: 'GROUP'
+    };
+  }
+
+  // 3️⃣ Repo list
+  url =
+    `${BASE_URL}/rest/api/1.0/projects/${project}/repos?limit=1000`;
+  d = await api(url);
+
+  evidence.push({
+    endpoint: url,
+    matched: false,
+    values: []
+  });
+
+  for (const r of d.values) {
+
+    // 4️⃣ Repo USER
+    const ru =
+      `${BASE_URL}/rest/api/1.0/projects/${project}/repos/${r.slug}/permissions/users?filter=${user}`;
+    const rd = await api(ru);
+
+    const ruMatches = rd.values.filter(v => v.user?.name === user);
+    evidence.push({
+      endpoint: ru,
+      matched: ruMatches.length > 0,
+      values: ruMatches
+    });
+
+    if (!decision.hasAccess && ruMatches.length) {
+      decision = {
+        hasAccess: true,
+        level: ruMatches[0].permission,
+        source: `REPO_USER:${r.slug}`,
+        category: 'USER',
+        repo: r.slug
+      };
+    }
+
+    // 5️⃣ Repo GROUP
+    const rg =
+      `${BASE_URL}/rest/api/1.0/projects/${project}/repos/${r.slug}/permissions/groups`;
+    const gd = await api(rg);
+
+    const rgMatches = [];
+    for (const g of gd.values) {
+      if (await isUserInGroup(g.group.name, user)) {
+        rgMatches.push(g);
+      }
+    }
+
+    evidence.push({
+      endpoint: rg,
+      matched: rgMatches.length > 0,
+      values: rgMatches
+    });
+
+    if (!decision.hasAccess && rgMatches.length) {
+      decision = {
+        hasAccess: true,
+        level: rgMatches[0].permission,
+        source: `REPO_GROUP:${r.slug}`,
+        category: 'GROUP'
+      };
+    }
+  }
+
+  return { ...decision, evidence };
+}
+
+/* ================= REVOKE ================= */
+
+async function revokeAccess(res, project, user) {
+  if (res.category !== 'USER') return;
+
+  if (res.source === 'PROJECT_USER') {
+    const url =
+      `${BASE_URL}/rest/api/1.0/projects/${project}/permissions/users?name=${user}`;
+    await api(url, 'delete');
+  }
+
+  if (res.source.startsWith('REPO_USER')) {
+    const url =
+      `${BASE_URL}/rest/api/1.0/projects/${project}/repos/${res.repo}/permissions/users?name=${user}`;
+    await api(url, 'delete');
+  }
+}
+
+/* ================= HTML ================= */
+
+function buildHtml(d) {
+  return `
+<html>
+<head>
+<style>
+body { background:#fff; font-family:Arial; font-size:12px; padding:20px; }
+table { border-collapse:collapse; width:100%; }
+th, td { border:1px solid #333; padding:6px; vertical-align:top; }
+th { background:#f2f2f2; width:220px; }
+pre { white-space:pre-wrap; font-size:11px; }
+</style>
+</head>
+<body>
+<table id="tbl">
+<tr><th>Username</th><td>${d.user}</td></tr>
+<tr><th>Account ID</th><td>${d.user}</td></tr>
+<tr><th>Project</th><td>${d.project}</td></tr>
+<tr><th>Timestamp (IST)</th><td>${tsIST()}</td></tr>
+<tr><th>Has Access</th><td>${d.hasAccess ? 'YES' : 'NO'}</td></tr>
+<tr><th>Permission Level</th><td>${d.level}</td></tr>
+<tr><th>Source</th><td>${d.source}</td></tr>
+<tr>
+  <th>API Response</th>
+  <td><pre>${JSON.stringify(d.evidence, null, 2)}</pre></td>
+</tr>
+</table>
+</body>
+</html>`;
+}
+
+/* ================= MAIN ================= */
+
+(async () => {
+  fs.writeFileSync(
+    REVOKED_CSV,
+    'User,Project,HasAccess,Level,Source,Timestamp,PNG\n'
+  );
+  fs.writeFileSync(
+    GROUP_CSV,
+    'User,Project,Source,Timestamp\n'
+  );
+
+  const rows = fs.readFileSync(INPUT_CSV, 'utf8')
+    .split('\n')
+    .slice(1)
+    .filter(Boolean)
+    .map(r => r.split(','));
+
+  const browser = await puppeteer.launch({
+    headless: true,
+    defaultViewport: { width: 1400, height: 900 }
+  });
+  const page = await browser.newPage();
+
+  for (const r of rows) {
+    const user = trim(r[0]);
+    const project = trim(r[2]);
+    if (!user || !project) continue;
+
+    const res = await resolveAccess(project, user);
+
+    await revokeAccess(res, project, user);
+
+    if (res.category === 'GROUP') {
+      fs.appendFileSync(
+        GROUP_CSV,
+        [user, project, res.source, tsIST()].join(',') + '\n'
+      );
+    }
+
+    const html = buildHtml({
+      user,
+      project,
+      hasAccess: res.hasAccess,
+      level: res.level,
+      source: res.source,
+      evidence: res.evidence
+    });
+
+    const pngPath = path.join(
+      res.hasAccess ? PNG_HAS : PNG_NO,
+      `${user}_${project}_${safeTs()}.png`
+    );
+
+    await page.setContent(html, { waitUntil: 'domcontentloaded' });
+    await (await page.$('#tbl')).screenshot({ path: pngPath, padding: 15 });
+
+    fs.appendFileSync(
+      REVOKED_CSV,
+      [
+        user,
+        project,
+        res.hasAccess ? 'YES' : 'NO',
+        res.level,
+        res.source,
+        tsIST(),
+        pngPath
+      ].join(',') + '\n'
+    );
+  }
+
+  await browser.close();
+
+  console.log('✅ Bitbucket access audit completed (reference-aligned)');
+})();
