@@ -1,0 +1,248 @@
+'use strict';
+
+/* ================= IMPORTS ================= */
+const fs = require('fs');
+const path = require('path');
+const axios = require('axios');
+const puppeteer = require('puppeteer');
+const officegen = require('officegen');
+require('dotenv').config();
+
+/* ================= CONFIG ================= */
+
+const INPUT_CSV = path.join(__dirname, 'input_files', 'access_check_results.csv');
+
+const OUTPUT_DIR = path.join(__dirname, 'output_files');
+const HTML_HAS = path.join(OUTPUT_DIR, 'html', 'has_access');
+const HTML_NO = path.join(OUTPUT_DIR, 'html', 'no_access');
+const PNG_HAS = path.join(OUTPUT_DIR, 'png', 'has_access');
+const PNG_NO = path.join(OUTPUT_DIR, 'png', 'no_access');
+const DOC_DIR = path.join(OUTPUT_DIR, 'doc');
+
+const REVOKED_CSV = path.join(OUTPUT_DIR, 'revoked_access_results.csv');
+const GROUP_CSV = path.join(OUTPUT_DIR, 'group_access_users.csv');
+
+const BASE_URL = process.env.BB_URL.replace(/\/+$/, '');
+const AUTH = {
+  username: process.env.BB_USERNAME,
+  password: process.env.BB_AUDIT_PWD
+};
+
+/* ================= UTILS ================= */
+
+const ensureDir = d => !fs.existsSync(d) && fs.mkdirSync(d, { recursive: true });
+const trim = v => String(v || '').trim();
+
+const tsIST = () =>
+  new Intl.DateTimeFormat('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    dateStyle: 'short',
+    timeStyle: 'medium',
+    hour12: false
+  }).format(new Date());
+
+const safeTs = () => tsIST().replace(/[^\d]/g, '-');
+
+[
+  OUTPUT_DIR,
+  HTML_HAS, HTML_NO,
+  PNG_HAS, PNG_NO,
+  DOC_DIR
+].forEach(ensureDir);
+
+/* ================= API ================= */
+
+async function api(url, method = 'get') {
+  try {
+    const r = await axios({ url, method, auth: AUTH });
+    return r.data || {};
+  } catch {
+    return null;
+  }
+}
+
+/* ================= GROUP CHECK ================= */
+
+async function isUserInGroup(group, user) {
+  const url =
+    `${BASE_URL}/rest/api/1.0/admin/groups/more-members` +
+    `?context=${encodeURIComponent(group)}` +
+    `&filter=${encodeURIComponent(user)}`;
+
+  const d = await api(url);
+  return d?.values?.length > 0;
+}
+
+/* ================= ACCESS RESOLUTION ================= */
+
+async function resolveAccess(project, user) {
+  const evidence = [];
+
+  /* ---- Project user ---- */
+  let url =
+    `${BASE_URL}/rest/api/1.0/projects/${project}/permissions/users?filter=${user}`;
+  let d = await api(url);
+
+  evidence.push({ endpoint: url, matched: !!d?.values?.length, values: d?.values || [] });
+
+  if (d?.values?.length) {
+    return {
+      type: 'PROJECT_USER',
+      permission: d.values[0].permission,
+      source: 'PROJECT_USER',
+      evidence
+    };
+  }
+
+  /* ---- Project groups ---- */
+  url = `${BASE_URL}/rest/api/1.0/projects/${project}/permissions/groups`;
+  d = await api(url);
+
+  evidence.push({ endpoint: url, matched: false, values: d?.values || [] });
+
+  for (const g of d?.values || []) {
+    if (await isUserInGroup(g.group?.name, user)) {
+      return {
+        type: 'GROUP_ACCESS',
+        permission: g.permission,
+        source: 'PROJECT_GROUP',
+        evidence
+      };
+    }
+  }
+
+  /* ---- Repo checks ---- */
+  const repos = await api(`${BASE_URL}/rest/api/1.0/projects/${project}/repos?limit=1000`);
+
+  for (const r of repos?.values || []) {
+    const ru =
+      `${BASE_URL}/rest/api/1.0/projects/${project}/repos/${r.slug}/permissions/users?filter=${user}`;
+    const rd = await api(ru);
+
+    evidence.push({ endpoint: ru, matched: !!rd?.values?.length, values: rd?.values || [] });
+
+    if (rd?.values?.length) {
+      return {
+        type: 'REPO_USER',
+        permission: rd.values[0].permission,
+        source: `REPO_USER:${r.slug}`,
+        evidence
+      };
+    }
+
+    const rg =
+      `${BASE_URL}/rest/api/1.0/projects/${project}/repos/${r.slug}/permissions/groups`;
+    const gd = await api(rg);
+
+    evidence.push({ endpoint: rg, matched: false, values: gd?.values || [] });
+
+    for (const g of gd?.values || []) {
+      if (await isUserInGroup(g.group?.name, user)) {
+        return {
+          type: 'GROUP_ACCESS',
+          permission: g.permission,
+          source: `REPO_GROUP:${r.slug}`,
+          evidence
+        };
+      }
+    }
+  }
+
+  return {
+    type: 'NO_ACCESS',
+    permission: '-',
+    source: '-',
+    evidence
+  };
+}
+
+/* ================= HTML (MATCHES SCREENSHOT) ================= */
+
+function buildHtml({ user, project, result }) {
+  return `
+<html>
+<body>
+<table id="tbl" border="1" cellpadding="6" cellspacing="0" style="width:900px;font-family:Arial">
+<tr><th>Username</th><td>${user}</td></tr>
+<tr><th>Account ID</th><td>${user}</td></tr>
+<tr><th>Project</th><td>${project}</td></tr>
+<tr><th>Timestamp (IST)</th><td>${tsIST()}</td></tr>
+<tr><th>Has Access</th><td style="color:${result.type === 'NO_ACCESS' ? 'red' : 'green'}">
+${result.type === 'NO_ACCESS' ? 'NO' : 'YES'}
+</td></tr>
+<tr><th>Permission Level</th><td>${result.permission || '-'}</td></tr>
+<tr><th>Source</th><td>${result.source || '-'}</td></tr>
+<tr><th>API Response</th>
+<td><pre style="font-size:12px">${JSON.stringify(result.evidence, null, 2)}</pre></td></tr>
+</table>
+</body>
+</html>`;
+}
+
+/* ================= DOCX (UNCHANGED) ================= */
+
+async function generateDoc(imageDir, outputName) {
+  const images = fs.readdirSync(imageDir).filter(f => f.endsWith('.png'));
+  if (!images.length) return;
+
+  const docx = officegen('docx');
+  docx.createP().addText(outputName.replace('.docx', ''), { bold: true });
+
+  images.forEach((img, i) => {
+    docx.createP().addImage(path.join(imageDir, img));
+    if (i < images.length - 1) {
+      docx.createP().addText('', { pageBreakBefore: true });
+    }
+  });
+
+  docx.generate(fs.createWriteStream(path.join(DOC_DIR, outputName)));
+}
+
+/* ================= MAIN ================= */
+
+(async () => {
+  const rows = fs.readFileSync(INPUT_CSV, 'utf8')
+    .split('\n').slice(1).filter(Boolean).map(r => r.split(','));
+
+  fs.writeFileSync(REVOKED_CSV, 'User,Project,AccessType,Timestamp,HTML,PNG\n');
+  fs.writeFileSync(GROUP_CSV, 'User,Project,Note,Timestamp\n');
+
+  const browser = await puppeteer.launch({ headless: true });
+  const page = await browser.newPage();
+
+  for (const r of rows) {
+    const user = trim(r[0]);
+    const project = trim(r[2]);
+    if (!user || !project) continue;
+
+    const result = await resolveAccess(project, user);
+
+    if (result.type === 'GROUP_ACCESS') {
+      fs.appendFileSync(GROUP_CSV,
+        [user, project, result.source, tsIST()].join(',') + '\n');
+    }
+
+    const html = buildHtml({ user, project, result });
+
+    const base = result.type === 'NO_ACCESS' ? PNG_NO : PNG_HAS;
+    const hdir = result.type === 'NO_ACCESS' ? HTML_NO : HTML_HAS;
+
+    const htmlPath = path.join(hdir, `${user}_${project}_${safeTs()}.html`);
+    const pngPath = path.join(base, `${user}_${project}_${safeTs()}.png`);
+
+    fs.writeFileSync(htmlPath, html);
+    await page.setContent(html);
+    await (await page.$('#tbl')).screenshot({ path: pngPath, padding: 15 });
+
+    if (result.type === 'PROJECT_USER' || result.type === 'REPO_USER') {
+      fs.appendFileSync(REVOKED_CSV,
+        [user, project, result.type, tsIST(), htmlPath, pngPath].join(',') + '\n');
+    }
+  }
+
+  await browser.close();
+  await generateDoc(PNG_HAS, 'has_access.docx');
+  await generateDoc(PNG_NO, 'no_access.docx');
+
+  console.log('✅ Audit completed successfully');
+})();
