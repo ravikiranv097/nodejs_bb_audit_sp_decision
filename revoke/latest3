@@ -1,0 +1,221 @@
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const axios = require('axios');
+const puppeteer = require('puppeteer');
+const { Document, Packer, Paragraph, Media } = require('docx');
+require('dotenv').config();
+
+/* ================= CONFIG ================= */
+
+const INPUT_CSV = path.join(__dirname, 'input_files', 'access_check_results.csv');
+
+const OUTPUT_DIR = path.join(__dirname, 'output_files');
+const HTML_HAS = path.join(OUTPUT_DIR, 'html', 'has_access');
+const HTML_NO = path.join(OUTPUT_DIR, 'html', 'no_access');
+const PNG_HAS = path.join(OUTPUT_DIR, 'png', 'has_access');
+const PNG_NO = path.join(OUTPUT_DIR, 'png', 'no_access');
+const DOC_DIR = path.join(OUTPUT_DIR, 'doc');
+
+const HAS_DOCX = path.join(DOC_DIR, 'has_access.docx');
+const NO_DOCX = path.join(DOC_DIR, 'no_access.docx');
+
+const BASE_URL = process.env.BB_URL?.replace(/\/+$/, '');
+const AUTH = {
+  username: process.env.BB_USERNAME,
+  password: process.env.BB_AUDIT_PWD
+};
+
+if (!BASE_URL || !AUTH.username || !AUTH.password) {
+  console.error('❌ Missing Bitbucket credentials');
+  process.exit(1);
+}
+
+/* ================= UTILS ================= */
+
+const ensureDir = d => !fs.existsSync(d) && fs.mkdirSync(d, { recursive: true });
+const trim = v => String(v || '').trim();
+
+const tsIST = () =>
+  new Intl.DateTimeFormat('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    dateStyle: 'short',
+    timeStyle: 'medium',
+    hour12: false
+  }).format(new Date());
+
+const safeTs = () => tsIST().replace(/[^\d]/g, '-');
+
+[
+  OUTPUT_DIR,
+  HTML_HAS, HTML_NO,
+  PNG_HAS, PNG_NO,
+  DOC_DIR
+].forEach(ensureDir);
+
+/* ================= API ================= */
+
+async function api(url, method = 'get') {
+  try {
+    const r = await axios({ url, method, auth: AUTH });
+    return r.data || {};
+  } catch {
+    return null;
+  }
+}
+
+/* ================= ACCESS RESOLUTION ================= */
+
+async function resolveAccess(project, user) {
+  const evidence = [];
+
+  // Project user
+  let url = `${BASE_URL}/rest/api/1.0/projects/${project}/permissions/users?filter=${user}`;
+  let d = await api(url);
+  evidence.push({
+    endpoint: url,
+    matched: !!d?.values?.length,
+    values: d?.values || []
+  });
+  if (d?.values?.length) return { type: 'PROJECT_USER', evidence };
+
+  // Repos
+  url = `${BASE_URL}/rest/api/1.0/projects/${project}/repos?limit=1000`;
+  const repos = await api(url);
+
+  for (const r of repos?.values || []) {
+    const ru =
+      `${BASE_URL}/rest/api/1.0/projects/${project}/repos/${r.slug}` +
+      `/permissions/users?filter=${user}`;
+    const rd = await api(ru);
+    evidence.push({
+      endpoint: ru,
+      matched: !!rd?.values?.length,
+      values: rd?.values || []
+    });
+    if (rd?.values?.length)
+      return { type: 'REPO_USER', repo: r.slug, evidence };
+  }
+
+  return { type: 'NO_ACCESS', evidence };
+}
+
+/* ================= HTML ================= */
+
+function buildHtml({ user, project, type, evidence }) {
+  const hasAccess = type !== 'NO_ACCESS';
+
+  return `
+<html>
+<head>
+<style>
+body { font-family: Arial; background: #fff; }
+table { width: 900px; border-collapse: collapse; font-size: 14px; }
+th { background: #f0f0f0; width: 220px; text-align: left; }
+td, th { border: 1px solid #999; padding: 6px; vertical-align: top; }
+.yes { color: green; font-weight: bold; }
+.no { color: red; font-weight: bold; }
+pre { margin: 0; font-size: 12px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<table id="tbl">
+<tr><th>Username</th><td>${user}</td></tr>
+<tr><th>Account ID</th><td>${user}</td></tr>
+<tr><th>Project</th><td>${project}</td></tr>
+<tr><th>Timestamp (IST)</th><td>${tsIST()}</td></tr>
+<tr>
+  <th>Has Access</th>
+  <td class="${hasAccess ? 'yes' : 'no'}">
+    ${hasAccess ? 'YES' : 'NO'}
+  </td>
+</tr>
+<tr><th>API Response</th>
+<td>
+<pre>${
+JSON.stringify(
+  evidence.map(e => ({
+    endpoint: e.endpoint,
+    matched: e.matched,
+    values: e.values
+  })),
+  null,
+  2
+)
+}</pre>
+</td>
+</tr>
+</table>
+</body>
+</html>`;
+}
+
+/* ================= MAIN ================= */
+
+(async () => {
+  const rows = fs.readFileSync(INPUT_CSV, 'utf8')
+    .split('\n')
+    .slice(1)
+    .filter(Boolean)
+    .map(r => r.split(','));
+
+  const hasImages = [];
+  const noImages = [];
+
+  const browser = await puppeteer.launch({
+    headless: true,
+    executablePath: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
+  });
+
+  const page = await browser.newPage();
+
+  for (const r of rows) {
+    const user = trim(r[0]);
+    const project = trim(r[2]);
+    if (!user || !project) continue;
+
+    const access = await resolveAccess(project, user);
+
+    const html = buildHtml({
+      user,
+      project,
+      type: access.type,
+      evidence: access.evidence
+    });
+
+    const pngPath = path.join(
+      access.type === 'NO_ACCESS' ? PNG_NO : PNG_HAS,
+      `${user}_${project}_${safeTs()}.png`
+    );
+
+    await page.setContent(html, { waitUntil: 'domcontentloaded' });
+    await (await page.$('#tbl')).screenshot({ path: pngPath, padding: 15 });
+
+    access.type === 'NO_ACCESS'
+      ? noImages.push(pngPath)
+      : hasImages.push(pngPath);
+  }
+
+  await browser.close();
+
+  /* ================= DOCX (SAFE) ================= */
+
+  function createDocx(images, outPath) {
+    const doc = new Document({
+      sections: [{
+        children: images.flatMap(img => [
+          new Paragraph(path.basename(img)),
+          Media.addImage(doc, fs.readFileSync(img), 600),
+          new Paragraph('')
+        ])
+      }]
+    });
+    fs.writeFileSync(outPath, Packer.toBuffer(doc));
+  }
+
+  createDocx(hasImages, HAS_DOCX);
+  createDocx(noImages, NO_DOCX);
+
+  console.log('\n✅ Access audit completed successfully');
+})();
