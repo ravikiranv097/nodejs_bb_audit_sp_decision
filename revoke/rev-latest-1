@@ -1,0 +1,274 @@
+'use strict';
+
+/* ===================== IMPORTS ===================== */
+const fs = require('fs');
+const path = require('path');
+const axios = require('axios');
+const puppeteer = require('puppeteer');
+const officegen = require('officegen');
+require('dotenv').config();
+
+/* ===================== CONFIG ===================== */
+
+const INPUT_DIR = path.join(__dirname, 'input_files');
+if (!fs.existsSync(INPUT_DIR)) throw new Error('input_files directory does not exist');
+
+const csvFiles = fs.readdirSync(INPUT_DIR).filter(f => f.endsWith('.csv'));
+if (!csvFiles.length) throw new Error('No CSV file found in input_files');
+
+const INPUT_CSV = path.join(INPUT_DIR, csvFiles[0]);
+
+const OUTPUT_DIR = path.join(__dirname, 'output_files');
+const HTML_HAS = path.join(OUTPUT_DIR, 'html', 'has_access');
+const HTML_NO = path.join(OUTPUT_DIR, 'html', 'no_access');
+const PNG_HAS = path.join(OUTPUT_DIR, 'png', 'has_access');
+const PNG_NO = path.join(OUTPUT_DIR, 'png', 'no_access');
+const DOC_DIR = path.join(OUTPUT_DIR, 'doc');
+
+const REVOKED_CSV = path.join(OUTPUT_DIR, 'revoked_access_results.csv');
+const GROUP_CSV = path.join(OUTPUT_DIR, 'group_access_users.csv');
+
+const BASE_URL = process.env.BB_URL.replace(/\/+$/, '');
+const AUTH = {
+  username: process.env.BB_USERNAME,
+  password: process.env.BB_AUDIT_PWD
+};
+
+/* ===================== UTILS ===================== */
+
+const ensureDir = d => !fs.existsSync(d) && fs.mkdirSync(d, { recursive: true });
+const trim = v => String(v || '').trim();
+
+const tsIST = () =>
+  new Intl.DateTimeFormat('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    dateStyle: 'short',
+    timeStyle: 'medium',
+    hour12: false
+  }).format(new Date());
+
+const safeTs = () => tsIST().replace(/[^\d]/g, '-');
+
+[
+  OUTPUT_DIR, HTML_HAS, HTML_NO, PNG_HAS, PNG_NO, DOC_DIR
+].forEach(ensureDir);
+
+/* ===================== API ===================== */
+
+async function api(url, method = 'get') {
+  try {
+    const r = await axios({ url, method, auth: AUTH });
+    return r.data || {};
+  } catch (e) {
+    console.error(`❌ API error: ${url}`);
+    return null;
+  }
+}
+
+/* ===================== GROUP CHECK ===================== */
+
+async function isUserInGroup(group, user) {
+  const url =
+    `${BASE_URL}/rest/api/1.0/admin/groups/more-members` +
+    `?context=${encodeURIComponent(group)}` +
+    `&filter=${encodeURIComponent(user)}`;
+
+  const d = await api(url);
+  return d?.values?.length > 0;
+}
+
+/* ===================== ACCESS RESOLUTION ===================== */
+
+async function resolveAccess(project, user) {
+  const evidence = [];
+
+  console.log(`🔍 Checking access for user=${user}, project=${project}`);
+
+  // ---- Project user ----
+  let url = `${BASE_URL}/rest/api/1.0/projects/${project}/permissions/users?filter=${user}`;
+  let d = await api(url);
+  evidence.push({ endpoint: url, matched: !!d?.values?.length, values: d?.values || [] });
+
+  if (d?.values?.length) {
+    console.log('✔ ACCESS via PROJECT_USER');
+    return {
+      type: 'PROJECT_USER',
+      permission: d.values[0].permission,
+      source: 'PROJECT_USER',
+      evidence
+    };
+  }
+
+  // ---- Project groups ----
+  url = `${BASE_URL}/rest/api/1.0/projects/${project}/permissions/groups`;
+  d = await api(url);
+
+  const idx = evidence.length;
+  evidence.push({ endpoint: url, matched: false, values: d?.values || [] });
+
+  for (const g of d?.values || []) {
+    if (await isUserInGroup(g.group?.name, user)) {
+      evidence[idx].matched = true;
+      console.log(`✔ ACCESS via PROJECT_GROUP (${g.group?.name})`);
+      return {
+        type: 'GROUP_ACCESS',
+        permission: g.permission,
+        source: g.group?.name,
+        evidence
+      };
+    }
+  }
+
+  // ---- Repo checks ----
+  const repos = await api(`${BASE_URL}/rest/api/1.0/projects/${project}/repos?limit=1000`);
+
+  for (const r of repos?.values || []) {
+    const ru =
+      `${BASE_URL}/rest/api/1.0/projects/${project}/repos/${r.slug}` +
+      `/permissions/users?filter=${user}`;
+
+    const rd = await api(ru);
+    evidence.push({ endpoint: ru, matched: !!rd?.values?.length, values: rd?.values || [] });
+
+    if (rd?.values?.length) {
+      console.log(`✔ ACCESS via REPO_USER (${r.slug})`);
+      return {
+        type: 'REPO_USER',
+        permission: rd.values[0].permission,
+        source: r.slug,
+        evidence
+      };
+    }
+
+    const rg =
+      `${BASE_URL}/rest/api/1.0/projects/${project}/repos/${r.slug}` +
+      `/permissions/groups`;
+
+    const gd = await api(rg);
+    const rgIdx = evidence.length;
+    evidence.push({ endpoint: rg, matched: false, values: gd?.values || [] });
+
+    for (const g of gd?.values || []) {
+      if (await isUserInGroup(g.group?.name, user)) {
+        evidence[rgIdx].matched = true;
+        console.log(`✔ ACCESS via REPO_GROUP (${g.group?.name})`);
+        return {
+          type: 'GROUP_ACCESS',
+          permission: g.permission,
+          source: g.group?.name,
+          evidence
+        };
+      }
+    }
+  }
+
+  console.log('❌ NO ACCESS found');
+  return { type: 'NO_ACCESS', permission: '-', source: '-', evidence };
+}
+
+/* ===================== HTML ===================== */
+
+function buildHtml({ user, project, result }) {
+  return `
+<html>
+<body>
+<table border="1" cellpadding="6" cellspacing="0" style="width:900px;font-family:Arial">
+<tr><th>User</th><td>${user}</td></tr>
+<tr><th>Project</th><td>${project}</td></tr>
+<tr><th>Timestamp</th><td>${tsIST()}</td></tr>
+<tr><th>Has Access</th>
+<td style="color:${result.type === 'NO_ACCESS' ? 'red' : 'green'}">
+${result.type === 'NO_ACCESS' ? 'NO' : 'YES'}
+</td></tr>
+<tr><th>Permission</th><td>${result.permission}</td></tr>
+<tr><th>Source</th><td>${result.source}</td></tr>
+<tr><th>API Evidence</th>
+<td><pre>${JSON.stringify(result.evidence, null, 2)}</pre></td></tr>
+</table>
+</body>
+</html>`;
+}
+
+/* ===================== DOCX ===================== */
+
+async function generateDoc(imageDir, outputName) {
+  const images = fs.readdirSync(imageDir).filter(f => f.endsWith('.png'));
+  if (!images.length) return;
+
+  const docx = officegen('docx');
+  docx.createP().addText(outputName.replace('.docx', ''), { bold: true });
+
+  images.forEach((img, i) => {
+    docx.createP().addImage(path.join(imageDir, img));
+    if (i < images.length - 1) docx.createP().addText('', { pageBreakBefore: true });
+  });
+
+  docx.generate(fs.createWriteStream(path.join(DOC_DIR, outputName)));
+}
+
+/* ===================== AUDIT LOG (NEW) ===================== */
+
+function auditLog({ user, project, result, revoked }) {
+  console.log(
+    `[audit] user=${user} | project=${project} | ` +
+    `access=${result.type}` +
+    (result.source ? ` | source=${result.source}` : '') +
+    ` | action=${revoked ? 'REVOKED' : 'NONE'}`
+  );
+}
+
+/* ===================== MAIN ===================== */
+
+(async () => {
+  const rows = fs.readFileSync(INPUT_CSV, 'utf8')
+    .split('\n').slice(1).filter(Boolean).map(r => r.split(','));
+
+  fs.writeFileSync(REVOKED_CSV, 'User,Project,AccessType,Timestamp,HTML,PNG\n');
+  fs.writeFileSync(GROUP_CSV, 'User,Project,Source,Timestamp\n');
+
+  const browser = await puppeteer.launch({ headless: true });
+  const page = await browser.newPage();
+
+  for (const r of rows) {
+    const user = trim(r[0]);
+    const project = trim(r[2]);
+    if (!user || !project) continue;
+
+    const result = await resolveAccess(project, user);
+
+    if (result.type === 'GROUP_ACCESS') {
+      fs.appendFileSync(GROUP_CSV,
+        [user, project, result.source, tsIST()].join(',') + '\n'
+      );
+    }
+
+    const html = buildHtml({ user, project, result });
+    const pngDir = result.type === 'NO_ACCESS' ? PNG_NO : PNG_HAS;
+    const htmlDir = result.type === 'NO_ACCESS' ? HTML_NO : HTML_HAS;
+
+    const htmlPath = path.join(htmlDir, `${user}_${project}_${safeTs()}.html`);
+    const pngPath = path.join(pngDir, `${user}_${project}_${safeTs()}.png`);
+
+    fs.writeFileSync(htmlPath, html);
+    await page.setContent(html);
+    await (await page.$('table')).screenshot({ path: pngPath, padding: 15 });
+
+    const revoked = result.type === 'PROJECT_USER' || result.type === 'REPO_USER';
+
+    if (revoked) {
+      fs.appendFileSync(REVOKED_CSV,
+        [user, project, result.type, tsIST(), htmlPath, pngPath].join(',') + '\n'
+      );
+    }
+
+    // ✅ SINGLE-LINE AUDIT OUTPUT
+    auditLog({ user, project, result, revoked });
+  }
+
+  await browser.close();
+
+  await generateDoc(PNG_HAS, 'has_access.docx');
+  await generateDoc(PNG_NO, 'no_access.docx');
+
+  console.log('✅ Access audit completed successfully');
+})();
