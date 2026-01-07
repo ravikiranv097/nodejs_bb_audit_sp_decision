@@ -1,0 +1,347 @@
+'use strict';
+
+/* ===================== IMPORTS ===================== */
+const fs = require('fs');
+const path = require('path');
+const xlsx = require('xlsx');
+const axios = require('axios');
+const puppeteer = require('puppeteer');
+const officegen = require('officegen');
+const imageSize = require('image-size');
+const winston = require('winston');
+const https = require('https');
+require('dotenv').config();
+
+/* ===================== CONFIG ===================== */
+const INPUT_DIR = path.join(__dirname, 'input_files');
+const OUTPUT_DIR = path.join(__dirname, 'output_files');
+const LOG_DIR = path.join(OUTPUT_DIR, 'logs');
+const DOC_DIR = path.join(OUTPUT_DIR, 'doc');
+
+const HAS_ACCESS_PNG_DIR = path.join(OUTPUT_DIR, 'png/has_access');
+const NO_ACCESS_PNG_DIR = path.join(OUTPUT_DIR, 'png/no_access');
+
+const ACCESS_CSV = path.join(OUTPUT_DIR, 'access.csv');
+const NO_ACCESS_CSV = path.join(OUTPUT_DIR, 'no_access.csv');
+
+[
+  OUTPUT_DIR,
+  LOG_DIR,
+  DOC_DIR,
+  HAS_ACCESS_PNG_DIR,
+  NO_ACCESS_PNG_DIR
+].forEach(d => !fs.existsSync(d) && fs.mkdirSync(d, { recursive: true }));
+
+const BASE_URL = process.env.BB_URL.replace(/\/$/, '');
+const USERNAME = process.env.BB_USERNAME;
+const PASSWORD = process.env.BB_AUDIT_PWD;
+
+/* ===================== UTILS ===================== */
+const trim = v => String(v || '').trim();
+
+const tsIST = () =>
+  new Intl.DateTimeFormat('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  }).format(new Date()).replace(',', '');
+
+const safeTs = () => tsIST().replace(/[^\d]/g, '-');
+
+const extractProjectKey = e => {
+  if (!e) return '';
+  const right = e.split(':')[1];
+  return right ? right.split('-')[0].trim() : '';
+};
+
+/* ===================== LOGGER ===================== */
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.printf(
+    ({ level, message }) => `${tsIST()} [${level}] ${message}`
+  ),
+  transports: [
+    new winston.transports.Console(),
+    new winston.transports.File({ filename: path.join(LOG_DIR, 'audit.log') })
+  ]
+});
+
+/* ===================== BITBUCKET CLIENT ===================== */
+class BitbucketClient {
+  constructor() {
+    this.client = axios.create({
+      baseURL: BASE_URL,
+      auth: { username: USERNAME, password: PASSWORD },
+      timeout: 30000,
+      httpsAgent: new https.Agent({ rejectUnauthorized: false }),
+      validateStatus: s => s < 500
+    });
+  }
+
+  async get(url) {
+    try {
+      const r = await this.client.get(url);
+      return r.data;
+    } catch (e) {
+      logger.error(`API error | ${url} | ${e.message}`);
+      return null;
+    }
+  }
+}
+
+/* ===================== PERMISSION RESOLVER ===================== */
+class PermissionResolver {
+  constructor(bb) {
+    this.bb = bb;
+  }
+
+  best(perms) {
+    const w = { ADMIN: 3, WRITE: 2, READ: 1 };
+    return perms.sort((a, b) => (w[b] || 0) - (w[a] || 0))[0];
+  }
+
+  async inGroup(group, user) {
+    const url =
+      `/rest/api/1.0/admin/groups/more-members?context=${encodeURIComponent(group)}&filter=${encodeURIComponent(user)}`;
+    const d = await this.bb.get(url);
+    return d?.values?.length > 0;
+  }
+
+  async checkProject(project, user) {
+    const accessCheck = { project: false, group: false, repo: false };
+
+    let url = `/rest/api/1.0/projects/${project}/permissions/users?filter=${user}`;
+    let d = await this.bb.get(url);
+    if (d?.values?.length) {
+      accessCheck.project = true;
+      return {
+        hasAccess: true,
+        level: this.best(d.values.map(v => v.permission)),
+        source: 'PROJECT_USER',
+        accessCheck
+      };
+    }
+
+    url = `/rest/api/1.0/projects/${project}/permissions/groups`;
+    d = await this.bb.get(url);
+    for (const g of d?.values || []) {
+      if (await this.inGroup(g.group.name, user)) {
+        accessCheck.group = true;
+        return {
+          hasAccess: true,
+          level: g.permission,
+          source: 'PROJECT_GROUP',
+          accessCheck
+        };
+      }
+    }
+
+    url = `/rest/api/1.0/projects/${project}/repos?limit=1000`;
+    const repos = (await this.bb.get(url))?.values || [];
+    for (const r of repos) {
+      const ru =
+        `/rest/api/1.0/projects/${project}/repos/${r.slug}/permissions/users?filter=${user}`;
+      const rd = await this.bb.get(ru);
+      if (rd?.values?.length) {
+        accessCheck.repo = true;
+        return {
+          hasAccess: true,
+          level: this.best(rd.values.map(v => v.permission)),
+          source: `REPO_USER:${r.slug}`,
+          accessCheck
+        };
+      }
+    }
+
+    return {
+      hasAccess: false,
+      level: '-',
+      source: '-',
+      accessCheck
+    };
+  }
+}
+
+/* ===================== HTML (UNCHANGED FORMAT YOU PROVIDED) ===================== */
+function buildEvidenceHtml({
+  user,
+  accountId,
+  project,
+  accessCheck,
+  hasAccess,
+  level,
+  source
+}) {
+  return `
+<html>
+<head>
+<style>
+body { font-family: Arial, Helvetica, sans-serif; padding: 20px; }
+table { border-collapse: collapse; width: 100%; }
+td { border: 1px solid #999; padding: 6px 10px; vertical-align: top; }
+td.label { font-weight: bold; background: #f2f2f2; width: 35%; }
+.yes { color: green; font-weight: bold; }
+.no { color: red; font-weight: bold; }
+.access-box { padding: 0; }
+.access-row { display: flex; border-bottom: 1px solid #999; }
+.access-row:last-child { border-bottom: none; }
+.access-key {
+  flex: 1;
+  padding: 6px 10px;
+  font-weight: bold;
+  background: #f2f2f2;
+  border-right: 1px solid #999;
+}
+.access-val {
+  width: 90px;
+  text-align: center;
+  padding: 6px 10px;
+}
+</style>
+</head>
+
+<body>
+<h2>Bitbucket Access Evidence</h2>
+
+<table id="evidence-table">
+<tr><td class="label">Username</td><td>${user}</td></tr>
+<tr><td class="label">Account ID</td><td>${accountId}</td></tr>
+<tr><td class="label">Project</td><td>${project}</td></tr>
+<tr><td class="label">Timestamp (IST)</td><td>${tsIST()}</td></tr>
+
+<tr>
+  <td class="label">Access Check</td>
+  <td class="access-box">
+    <div class="access-row"><span class="access-key">Project</span><span class="access-val ${accessCheck.project ? 'yes' : 'no'}">${accessCheck.project ? 'Yes' : 'No'}</span></div>
+    <div class="access-row"><span class="access-key">Group</span><span class="access-val ${accessCheck.group ? 'yes' : 'no'}">${accessCheck.group ? 'Yes' : 'No'}</span></div>
+    <div class="access-row"><span class="access-key">Repo</span><span class="access-val ${accessCheck.repo ? 'yes' : 'no'}">${accessCheck.repo ? 'Yes' : 'No'}</span></div>
+  </td>
+</tr>
+
+<tr><td class="label">Has Access</td><td class="${hasAccess ? 'yes' : 'no'}">${hasAccess ? 'Yes' : 'No'}</td></tr>
+<tr><td class="label">Permission Level</td><td>${level}</td></tr>
+<tr><td class="label">Source</td><td>${source}</td></tr>
+</table>
+</body>
+</html>`;
+}
+
+/* ===================== DOCX (UPDATED AS PER IMAGE) ===================== */
+async function generateDoc(imageDir, outputName) {
+  const images = fs.readdirSync(imageDir).filter(f => f.endsWith('.png'));
+  if (!images.length) return;
+
+  const docx = officegen('docx');
+  const MAX_WIDTH = 480;
+
+  images.forEach((img, index) => {
+    const imgPath = path.join(imageDir, img);
+    const buffer = fs.readFileSync(imgPath);
+    const { width, height } = imageSize(buffer);
+
+    const scale = width > MAX_WIDTH ? MAX_WIDTH / width : 1;
+    const finalWidth = Math.round(width * scale);
+    const finalHeight = Math.round(height * scale);
+
+    const p = docx.createP({ align: 'center' });
+    p.addImage(imgPath, { cx: finalWidth, cy: finalHeight });
+    p.addLineBreak();
+
+    if ((index + 1) % 2 === 0 && index + 1 < images.length) {
+      docx.createP().addText('', { pageBreakBefore: true });
+    }
+  });
+
+  docx.generate(
+    fs.createWriteStream(path.join(DOC_DIR, outputName))
+  );
+}
+
+/* ===================== MAIN ===================== */
+(async function main() {
+  logger.info('Bitbucket audit started');
+
+  fs.writeFileSync(ACCESS_CSV, 'User,Project,Result\n');
+  fs.writeFileSync(NO_ACCESS_CSV, 'User,Project,Result\n');
+
+  const inputFile = fs.readdirSync(INPUT_DIR).find(f => f.endsWith('.xlsx'));
+  const wb = xlsx.readFile(path.join(INPUT_DIR, inputFile));
+  const rows = xlsx.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: '' });
+
+  /* ---- DEDUP + FILTER (RESTORED) ---- */
+  const seen = new Set();
+  const unique = [];
+  for (const r of rows) {
+    const sso = trim(r['User SSO']);
+    if (!sso || seen.has(sso)) continue;
+    seen.add(sso);
+    unique.push(r);
+  }
+
+  const targets = unique.filter(r =>
+    trim(r['User Status']) === 'Orphan' &&
+    trim(r['Decision']) !== 'Keep'
+  );
+
+  const bb = new BitbucketClient();
+  const resolver = new PermissionResolver(bb);
+
+  const browser = await puppeteer.launch({ headless: true });
+  const page = await browser.newPage();
+
+  for (const r of targets) {
+    const user = trim(r['User SSO']);
+    const accountId = trim(r['Account ID']);
+    const project = extractProjectKey(r['Entitlement Description']);
+    if (!user || !project) continue;
+
+    logger.info(`Checking | user=${user} | project=${project}`);
+
+    const res = await resolver.checkProject(project, user);
+
+    logger.info(
+      `Result | user=${user} | project=${project} | hasAccess=${res.hasAccess} | project=${res.accessCheck.project} | group=${res.accessCheck.group} | repo=${res.accessCheck.repo} | level=${res.level} | source=${res.source}`
+    );
+
+    const html = buildEvidenceHtml({
+      user,
+      accountId,
+      project,
+      accessCheck: res.accessCheck,
+      hasAccess: res.hasAccess,
+      level: res.level,
+      source: res.source
+    });
+
+    await page.setContent(html, { waitUntil: 'domcontentloaded' });
+
+    const pngPath = path.join(
+      res.hasAccess ? HAS_ACCESS_PNG_DIR : NO_ACCESS_PNG_DIR,
+      `${user}_${project}_${safeTs()}.png`
+    );
+
+    const table = await page.$('#evidence-table');
+    await table.screenshot({ path: pngPath, padding: 15 });
+
+    logger.info(`Screenshot captured | ${pngPath}`);
+
+    fs.appendFileSync(
+      res.hasAccess ? ACCESS_CSV : NO_ACCESS_CSV,
+      `${user},${project},${res.hasAccess ? 'ACCESS' : 'NO_ACCESS'}\n`
+    );
+
+    logger.info(`CSV updated | ${res.hasAccess ? 'ACCESS' : 'NO_ACCESS'} | ${user} | ${project}`);
+  }
+
+  await browser.close();
+
+  await generateDoc(HAS_ACCESS_PNG_DIR, 'Bitbucket_Has_Access_Report.docx');
+  await generateDoc(NO_ACCESS_PNG_DIR, 'Bitbucket_No_Access_Report.docx');
+
+  logger.info('Bitbucket audit completed successfully');
+})();
