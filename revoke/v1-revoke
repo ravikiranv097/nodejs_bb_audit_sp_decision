@@ -1,0 +1,232 @@
+'use strict';
+
+/* ===================== IMPORTS ===================== */
+const fs = require('fs');
+const path = require('path');
+const axios = require('axios');
+const puppeteer = require('puppeteer');
+const officegen = require('officegen');
+const imageSize = require('image-size');
+const https = require('https');
+require('dotenv').config();
+
+/* ===================== CONFIG ===================== */
+const INPUT_DIR = path.join(__dirname, 'input_files');
+const OUTPUT_DIR = path.join(__dirname, 'output_files');
+const HTML_HAS = path.join(OUTPUT_DIR, 'html/has_access');
+const HTML_NO = path.join(OUTPUT_DIR, 'html/no_access');
+const PNG_HAS = path.join(OUTPUT_DIR, 'png/has_access');
+const PNG_NO = path.join(OUTPUT_DIR, 'png/no_access');
+const DOC_DIR = path.join(OUTPUT_DIR, 'doc');
+
+[
+  OUTPUT_DIR,
+  HTML_HAS,
+  HTML_NO,
+  PNG_HAS,
+  PNG_NO,
+  DOC_DIR
+].forEach(d => !fs.existsSync(d) && fs.mkdirSync(d, { recursive: true }));
+
+const INPUT_CSV = fs.readdirSync(INPUT_DIR).find(f => f.endsWith('.csv'));
+if (!INPUT_CSV) throw new Error('No CSV found');
+
+const BASE_URL = process.env.BB_URL.replace(/\/$/, '');
+const AUTH = {
+  username: process.env.BB_USERNAME,
+  password: process.env.BB_AUDIT_PWD
+};
+
+/* ===================== UTILS ===================== */
+const trim = v => String(v || '').trim();
+
+const tsIST = () =>
+  new Intl.DateTimeFormat('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    dateStyle: 'short',
+    timeStyle: 'medium',
+    hour12: false
+  }).format(new Date());
+
+const safeTs = () => tsIST().replace(/[^\d]/g, '-');
+
+/* ===================== API ===================== */
+async function api(url, method = 'get') {
+  try {
+    const r = await axios({
+      url,
+      method,
+      auth: AUTH,
+      httpsAgent: new https.Agent({ rejectUnauthorized: false })
+    });
+    return r.data || {};
+  } catch {
+    console.error(`[API ERROR] ${url}`);
+    return {};
+  }
+}
+
+/* ===================== GROUP CHECK ===================== */
+async function isUserInGroup(group, user) {
+  const url =
+    `${BASE_URL}/rest/api/1.0/admin/groups/more-members` +
+    `?context=${encodeURIComponent(group)}&filter=${encodeURIComponent(user)}`;
+  const d = await api(url);
+  return (d?.values || []).length > 0;
+}
+
+/* ===================== ACCESS RESOLUTION ===================== */
+async function resolveAccess(project, user) {
+  const accessCheck = { project: false, group: false, repo: false };
+
+  console.log(`Checking | user=${user} | project=${project}`);
+
+  let url =
+    `${BASE_URL}/rest/api/1.0/projects/${project}/permissions/users?filter=${user}`;
+  let d = await api(url);
+  if (d?.values?.length) {
+    accessCheck.project = true;
+    return { type: 'PROJECT_USER', permission: d.values[0].permission, source: 'PROJECT_USER', accessCheck };
+  }
+
+  url = `${BASE_URL}/rest/api/1.0/projects/${project}/permissions/groups`;
+  d = await api(url);
+  for (const g of d.values || []) {
+    if (await isUserInGroup(g.group.name, user)) {
+      accessCheck.group = true;
+      return { type: 'GROUP_ACCESS', permission: g.permission, source: g.group.name, accessCheck };
+    }
+  }
+
+  const repos = await api(`${BASE_URL}/rest/api/1.0/projects/${project}/repos?limit=1000`);
+  for (const r of repos.values || []) {
+    const ru =
+      `${BASE_URL}/rest/api/1.0/projects/${project}/repos/${r.slug}` +
+      `/permissions/users?filter=${user}`;
+    const rd = await api(ru);
+    if (rd?.values?.length) {
+      accessCheck.repo = true;
+      return { type: 'REPO_USER', permission: rd.values[0].permission, source: r.slug, accessCheck };
+    }
+  }
+
+  return { type: 'NO_ACCESS', permission: '-', source: '-', accessCheck };
+}
+
+/* ===================== HTML (UPDATED FORMAT) ===================== */
+function buildHtml({ user, accountId, project, result }) {
+  const ac = result.accessCheck;
+
+  return `
+<html>
+<head>
+<style>
+body { font-family: Arial; padding: 20px; }
+table { border-collapse: collapse; width: 100%; }
+td { border: 1px solid #999; padding: 6px 10px; }
+td.label { font-weight: bold; background: #f2f2f2; width: 35%; }
+.yes { color: green; font-weight: bold; }
+.no { color: red; font-weight: bold; }
+.access-row { display: flex; border-bottom: 1px solid #999; }
+.access-row:last-child { border-bottom: none; }
+.access-key { flex: 1; background: #f2f2f2; font-weight: bold; padding: 6px; }
+.access-val { width: 90px; text-align: center; padding: 6px; }
+</style>
+</head>
+<body>
+
+<h2>Bitbucket Access Evidence</h2>
+
+<table>
+<tr><td class="label">Username</td><td>${user}</td></tr>
+<tr><td class="label">Account ID</td><td>${accountId}</td></tr>
+<tr><td class="label">Project</td><td>${project}</td></tr>
+<tr><td class="label">Timestamp (IST)</td><td>${tsIST()}</td></tr>
+
+<tr>
+<td class="label">Access Check</td>
+<td>
+  <div class="access-row"><span class="access-key">Project</span><span class="access-val ${ac.project ? 'yes' : 'no'}">${ac.project ? 'Yes' : 'No'}</span></div>
+  <div class="access-row"><span class="access-key">Group</span><span class="access-val ${ac.group ? 'yes' : 'no'}">${ac.group ? 'Yes' : 'No'}</span></div>
+  <div class="access-row"><span class="access-key">Repo</span><span class="access-val ${ac.repo ? 'yes' : 'no'}">${ac.repo ? 'Yes' : 'No'}</span></div>
+</td>
+</tr>
+
+<tr><td class="label">Has Access</td><td class="${result.type === 'NO_ACCESS' ? 'no' : 'yes'}">${result.type === 'NO_ACCESS' ? 'No' : 'Yes'}</td></tr>
+<tr><td class="label">Permission Level</td><td>${result.permission}</td></tr>
+<tr><td class="label">Source</td><td>${result.source}</td></tr>
+</table>
+
+</body>
+</html>`;
+}
+
+/* ===================== DOCX (UPDATED) ===================== */
+async function generateDoc(imageDir, outputName) {
+  const images = fs.readdirSync(imageDir).filter(f => f.endsWith('.png'));
+  if (!images.length) return;
+
+  const docx = officegen('docx');
+  const MAX_WIDTH = 480;
+
+  images.forEach((img, i) => {
+    const imgPath = path.join(imageDir, img);
+    const buffer = fs.readFileSync(imgPath);
+    const { width, height } = imageSize(buffer);
+    const scale = width > MAX_WIDTH ? MAX_WIDTH / width : 1;
+
+    const p = docx.createP({ align: 'center' });
+    p.addImage(imgPath, {
+      cx: Math.round(width * scale),
+      cy: Math.round(height * scale)
+    });
+
+    if ((i + 1) % 2 === 0 && i + 1 < images.length) {
+      docx.createP().addText('', { pageBreakBefore: true });
+    }
+  });
+
+  docx.generate(fs.createWriteStream(path.join(DOC_DIR, outputName)));
+}
+
+/* ===================== MAIN ===================== */
+(async () => {
+  const rows = fs.readFileSync(path.join(INPUT_DIR, INPUT_CSV), 'utf8')
+    .split('\n').slice(1).filter(Boolean).map(r => r.split(','));
+
+  const browser = await puppeteer.launch({ headless: true });
+  const page = await browser.newPage();
+
+  for (const r of rows) {
+    const user = trim(r[0]);
+    const accountId = trim(r[1]);
+    const project = trim(r[2]);
+    if (!user || !project) continue;
+
+    const result = await resolveAccess(project, user);
+
+    console.log(
+      `Result | user=${user} | project=${project} | type=${result.type} | permission=${result.permission} | source=${result.source}`
+    );
+
+    const html = buildHtml({ user, accountId, project, result });
+    const htmlDir = result.type === 'NO_ACCESS' ? HTML_NO : HTML_HAS;
+    const pngDir = result.type === 'NO_ACCESS' ? PNG_NO : PNG_HAS;
+
+    const htmlPath = path.join(htmlDir, `${user}_${project}_${safeTs()}.html`);
+    const pngPath = path.join(pngDir, `${user}_${project}_${safeTs()}.png`);
+
+    fs.writeFileSync(htmlPath, html);
+    await page.setContent(html);
+    await (await page.$('table')).screenshot({ path: pngPath, padding: 15 });
+
+    console.log(`Screenshot captured | ${pngPath}`);
+  }
+
+  await browser.close();
+
+  await generateDoc(PNG_HAS, 'has_access.docx');
+  await generateDoc(PNG_NO, 'no_access.docx');
+
+  console.log('Access audit + revoke completed');
+})();
