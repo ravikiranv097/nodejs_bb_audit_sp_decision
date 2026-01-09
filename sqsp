@@ -141,4 +141,43 @@ body {
 
 
 
+const puppeteer = require("puppeteer");
+const fs = require("fs");
 
+async function generatePNG(htmlPath, outputPath) {
+  const browser = await puppeteer.launch({
+    headless: "new",
+    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+  });
+
+  const page = await browser.newPage();
+
+  /* ============================
+     🔒 A4 @ 300 DPI VIEWPORT
+     ============================ */
+  await page.setViewport({
+    width: 2480,   // A4 width @ 300 DPI
+    height: 3508,  // A4 height @ 300 DPI
+    deviceScaleFactor: 1
+  });
+
+  const htmlContent = fs.readFileSync(htmlPath, "utf8");
+
+  await page.setContent(htmlContent, {
+    waitUntil: ["load", "domcontentloaded", "networkidle0"]
+  });
+
+  /* 🔥 FORCE RENDER */
+  await page.evaluate(() => document.fonts.ready);
+  await page.waitForTimeout(300);
+
+  await page.screenshot({
+    path: outputPath,
+    fullPage: true,
+    type: "png"
+  });
+
+  await browser.close();
+}
+
+module.exports = generatePNG;
