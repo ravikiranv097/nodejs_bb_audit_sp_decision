@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Access Evidence</title>
+
+<style>
+/* =========================
+   A4 PAGE SETUP
+========================= */
+body {
+  margin: 0;
+  padding: 0;
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+.page {
+  width: 210mm;
+  height: 297mm;
+  padding: 15mm;
+  box-sizing: border-box;
+}
+
+/* =========================
+   USER BLOCK (FIXED SIZE)
+========================= */
+.user-block {
+  width: 100%;
+  height: 55mm;               /* FIXED HEIGHT */
+  border: 1px solid #000;
+  margin-bottom: 8mm;
+  box-sizing: border-box;
+}
+
+/* =========================
+   TABLE (FIXED LAYOUT)
+========================= */
+.user-table {
+  width: 100%;
+  height: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;        /* 🔒 CRITICAL */
+}
+
+.user-table td {
+  border: 1px solid #999;
+  padding: 6px 8px;
+  font-size: 12px;
+  vertical-align: top;
+  box-sizing: border-box;
+}
+
+/* LEFT COLUMN */
+.user-table .label {
+  width: 35%;
+  font-weight: bold;
+  background-color: #f2f2f2;
+}
+
+/* RIGHT COLUMN */
+.user-table .value {
+  width: 65%;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+}
+
+/* ACCESS COLORS */
+.yes {
+  color: green;
+  font-weight: bold;
+}
+
+.no {
+  color: red;
+  font-weight: bold;
+}
+
+/* =========================
+   PERMISSION LEVEL (STACKED)
+========================= */
+.perm-list {
+  max-height: 30mm;           /* FIXED AREA */
+  overflow: hidden;           /* Prevent layout break */
+}
+
+.perm-item {
+  line-height: 1.4;
+}
+</style>
+</head>
+
+<body>
+
+<div class="page">
+
+  {{#each users}}
+  <div class="user-block">
+    <table class="user-table">
+      <tr>
+        <td class="label">Username</td>
+        <td class="value">{{username}}</td>
+      </tr>
+      <tr>
+        <td class="label">Account ID</td>
+        <td class="value">{{accountId}}</td>
+      </tr>
+      <tr>
+        <td class="label">Timestamp (IST)</td>
+        <td class="value">{{timestamp}}</td>
+      </tr>
+      <tr>
+        <td class="label">Has Access (Yes/No)</td>
+        <td class="value {{#if hasAccess}}yes{{else}}no{{/if}}">
+          {{#if hasAccess}}YES{{else}}NO{{/if}}
+        </td>
+      </tr>
+      <tr>
+        <td class="label">Permission Level</td>
+        <td class="value">
+          <div class="perm-list">
+            {{#each permissionLevels}}
+              <div class="perm-item">{{this}}</div>
+            {{/each}}
+          </div>
+        </td>
+      </tr>
+    </table>
+  </div>
+  {{/each}}
+
+</div>
+
+</body>
+</html>
+
+
+
+
+
+
+
+
+
+
