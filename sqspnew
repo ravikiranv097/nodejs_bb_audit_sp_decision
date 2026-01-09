@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Access Evidence</title>
+
+<style>
+/* =========================
+   BASE
+========================= */
+body {
+  margin: 0;
+  padding: 0;
+  font-family: Arial, Helvetica, sans-serif;
+  background: #2b2b2b; /* dark background like PNG viewer */
+}
+
+/* =========================
+   PAGE (CENTER CONTENT)
+========================= */
+.page {
+  width: 1240px;                 /* PNG-friendly A4 ratio */
+  min-height: 1754px;
+  margin: 0 auto;
+  padding: 80px 0;
+  box-sizing: border-box;
+  background: transparent;
+
+  display: flex;
+  flex-direction: column;
+  align-items: center;           /* 🔥 CENTER TABLES */
+}
+
+/* =========================
+   USER BLOCK (CARD)
+========================= */
+.user-block {
+  width: 720px;                  /* 🔥 DOCX-LIKE SCALE */
+  background: #ffffff;
+  border: 2px solid #999;
+  margin-bottom: 60px;
+  box-sizing: border-box;
+}
+
+/* =========================
+   TABLE
+========================= */
+.user-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+
+.user-table td {
+  border: 1px solid #999;
+  padding: 8px 10px;
+  font-size: 13px;
+  vertical-align: middle;
+}
+
+/* LEFT COLUMN */
+.label {
+  width: 35%;
+  font-weight: bold;
+  background: #f2f2f2;
+}
+
+/* RIGHT COLUMN */
+.value {
+  width: 65%;
+  word-break: break-word;
+}
+
+/* =========================
+   ACCESS COLORS
+========================= */
+.yes {
+  color: green;
+  font-weight: bold;
+}
+
+.no {
+  color: red;
+  font-weight: bold;
+}
+
+/* =========================
+   PERMISSION LEVEL
+========================= */
+.perm-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.perm-item {
+  line-height: 1.4;
+}
+</style>
+</head>
+
+<body>
+
+<div class="page">
+
+  {{#each users}}
+  <div class="user-block">
+    <table class="user-table">
+      <tr>
+        <td class="label">Username</td>
+        <td class="value">{{username}}</td>
+      </tr>
+      <tr>
+        <td class="label">Account ID</td>
+        <td class="value">{{accountId}}</td>
+      </tr>
+      <tr>
+        <td class="label">Timestamp (IST)</td>
+        <td class="value">{{timestamp}}</td>
+      </tr>
+      <tr>
+        <td class="label">Has Access</td>
+        <td class="value {{#if hasAccess}}yes{{else}}no{{/if}}">
+          {{#if hasAccess}}Yes{{else}}No{{/if}}
+        </td>
+      </tr>
+      <tr>
+        <td class="label">Permission Level</td>
+        <td class="value">
+          <div class="perm-list">
+            {{#each permissionLevels}}
+              <div class="perm-item">{{this}}</div>
+            {{/each}}
+          </div>
+        </td>
+      </tr>
+    </table>
+  </div>
+  {{/each}}
+
+</div>
+
+</body>
+</html>
