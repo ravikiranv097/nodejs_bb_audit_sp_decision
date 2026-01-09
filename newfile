@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      font-size: 12px;
+      margin: 0;
+      padding: 10px;
+      width: 744px;              /* 🔑 MATCH PNG WIDTH */
+      box-sizing: border-box;
+    }
+
+    table {
+      border-collapse: collapse;
+      width: 100%;
+    }
+
+    td {
+      border: 1px solid #000;
+      padding: 6px;
+      vertical-align: top;
+    }
+
+    .label {
+      font-weight: bold;
+      background: #f2f2f2;
+      white-space: nowrap;
+      width: 160px;
+    }
+
+    .yes {
+      color: green;
+      font-weight: bold;
+    }
+
+    .no {
+      color: red;
+      font-weight: bold;
+    }
+
+    pre {
+      font-size: 10px;
+      white-space: pre-wrap;
+      margin: 0;
+    }
+  </style>
+</head>
+
+<body>
+  <table>
+    <tr><td class="label">Username</td><td>{{Username}}</td></tr>
+    <tr><td class="label">Account ID</td><td>{{AccountID}}</td></tr>
+    <tr><td class="label">Project</td><td>{{Project}}</td></tr>
+    <tr><td class="label">Timestamp (IST)</td><td>{{Timestamp}}</td></tr>
+    <tr>
+      <td class="label">Has Access</td>
+      <td class="{{AccessClass}}">{{HasAccess}}</td>
+    </tr>
+    <tr><td class="label">Permission Level</td><td>{{Permission}}</td></tr>
+    <tr>
+      <td class="label">API Response</td>
+      <td><pre>{{ApiResponse}}</pre></td>
+    </tr>
+  </table>
+</body>
+</html>
+
+
+
+
+
+
+
+
+
+const puppeteer = require("puppeteer");
+const fs = require("fs-extra");
+const Handlebars = require("handlebars");
+const path = require("path");
+
+const templateHtml = fs.readFileSync(
+  path.join(__dirname, "templates/evidence.html"),
+  "utf8"
+);
+
+const template = Handlebars.compile(templateHtml);
+
+exports.generatePNG = async (evidence, outputDir) => {
+  await fs.ensureDir(outputDir);
+
+  const browser = await puppeteer.launch({
+    headless: "new",
+    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+  });
+
+  const page = await browser.newPage();
+
+  const html = template({
+    Username: evidence["Username"],
+    AccountID: evidence["Account ID"],
+    Project: evidence["Project"],
+    Timestamp: evidence["Timestamp (IST)"],
+    HasAccess: evidence["Has Access"],
+    AccessClass: evidence["Has Access"] === "YES" ? "yes" : "no",
+    Permission: evidence["Permission Level"],
+    ApiResponse: JSON.stringify(evidence["API Response"], null, 2)
+  });
+
+  await page.setViewport({
+    width: 744,
+    height: 311,
+    deviceScaleFactor: 1
+  });
+
+  await page.setContent(html, { waitUntil: "networkidle0" });
+
+  // Ensure fonts/layout fully settled
+  await page.evaluate(() => document.fonts.ready);
+
+  const fileName = `${evidence["Username"]}_${evidence["Project"]}_${Date.now()}.png`;
+  const filePath = path.join(outputDir, fileName);
+
+  // 🔥 EXACT 744 × 311 OUTPUT
+  await page.screenshot({
+    path: filePath
+  });
+
+  await browser.close();
+
+  return filePath;
+};
